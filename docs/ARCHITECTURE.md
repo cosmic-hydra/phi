@@ -1,4 +1,4 @@
-# NexChain Technical Architecture & Component Breakdown
+# Phi Technical Architecture & Component Breakdown
 
 > Companion to [SPECIFICATION.md](./SPECIFICATION.md).
 
@@ -18,20 +18,20 @@ pipeline. Go remains a good choice for auxiliary services (indexers, faucets).
 ## 2. Codebase Directory Structure
 
 ```
-nexchain/
+phi/
 ├── Cargo.toml                  # workspace root
 ├── crates/
-│   ├── nex-types/              # core types: blocks, txs, objects, accounts, crypto newtypes
-│   ├── nex-crypto/             # hashing, signatures, VRF, (later) threshold BLS
-│   ├── nex-state/              # object store, sparse Merkle tree, versioning
-│   ├── nex-vm/                 # NexVM host: wasmtime embedding, gas metering, ABI
-│   ├── nex-mempool/            # admission, access-set conflict graph, lane routing
-│   ├── nex-consensus/          # NexBFT: pacemaker, vote aggregation, QC, sortition
-│   ├── nex-executor/           # parallel scheduler (owned fast path + shared ordered path)
-│   ├── nex-da/                 # erasure coding, blob store, sampling client
-│   ├── nex-p2p/                # libp2p networking: gossip, sync, RPC
-│   ├── nex-node/               # node binary wiring all components
-│   └── nex-sim/                # local multi-node simulation harness
+│   ├── phi-types/              # core types: blocks, txs, objects, accounts, crypto newtypes
+│   ├── phi-crypto/             # hashing, signatures, VRF, (later) threshold BLS
+│   ├── phi-state/              # object store, sparse Merkle tree, versioning
+│   ├── phi-vm/                 # PhiVM host: wasmtime embedding, gas metering, ABI
+│   ├── phi-mempool/            # admission, access-set conflict graph, lane routing
+│   ├── phi-consensus/          # Cargo: pacemaker, vote aggregation, QC, sortition
+│   ├── phi-executor/           # parallel scheduler (owned fast path + shared ordered path)
+│   ├── phi-da/                 # erasure coding, blob store, sampling client
+│   ├── phi-p2p/                # libp2p networking: gossip, sync, RPC
+│   ├── phi-node/               # node binary wiring all components
+│   └── phi-sim/                # local multi-node simulation harness
 ├── contracts/                  # standard library + example contracts
 │   ├── std/                    # account, coin, name-registry modules
 │   └── examples/
@@ -43,20 +43,20 @@ nexchain/
 ```
 
 The starter repository in this repo implements a vertical slice:
-`nex-types`, `nex-state`, `nex-consensus` (stub), `nex-mempool`, and `nex-sim`.
+`phi-types`, `phi-state`, `phi-consensus` (stub), `phi-mempool`, and `phi-sim`.
 
 ## 3. Core Modules and Responsibilities
 
 | Module | Responsibilities | Key interfaces |
 |---|---|---|
-| **nex-p2p** | Peer discovery, gossip (txs, votes, blocks), state-sync streams, DA sampling requests | `broadcast(msg)`, `subscribe(topic)` |
-| **nex-mempool** | Signature & auth pre-validation, fee/quota checks, access-set conflict graph, encrypted-tx holding, lane routing | `submit(tx) -> Admitted/Rejected`, `take_batch(lane, n)` |
-| **nex-consensus** | Leader/proposer election (VRF), HotStuff rounds, quorum certificates, randomness beacon, slashing evidence | `propose(batch)`, `on_vote(v)`, `committed() -> Block` |
-| **nex-executor** | Deterministic parallel execution: schedule disjoint access sets across cores; owned-object fast path; receipt generation | `execute(block, state) -> (new_root, receipts)` |
-| **nex-vm** | WASM instantiation, determinism enforcement, gas metering, host functions (object read/write, crypto, events), bytecode verification at publish | `call(module, func, args, gas)` |
-| **nex-state** | Versioned object store, SMT root computation, snapshots, proofs | `get/put(object)`, `root()`, `prove(id)` |
-| **nex-da** | Blob erasure coding, KZG commitments, availability sampling, archival interface | `publish(blob) -> commitment`, `sample(commitment)` |
-| **nex-types / nex-crypto** | Canonical serialization, hashing (BLAKE3), signatures (Ed25519 now; pluggable), VRF | shared by all |
+| **phi-p2p** | Peer discovery, gossip (txs, votes, blocks), state-sync streams, DA sampling requests | `broadcast(msg)`, `subscribe(topic)` |
+| **phi-mempool** | Signature & auth pre-validation, fee/quota checks, access-set conflict graph, encrypted-tx holding, lane routing | `submit(tx) -> Admitted/Rejected`, `take_batch(lane, n)` |
+| **phi-consensus** | Leader/proposer election (VRF), HotStuff rounds, quorum certificates, randomness beacon, slashing evidence | `propose(batch)`, `on_vote(v)`, `committed() -> Block` |
+| **phi-executor** | Deterministic parallel execution: schedule disjoint access sets across cores; owned-object fast path; receipt generation | `execute(block, state) -> (new_root, receipts)` |
+| **phi-vm** | WASM instantiation, determinism enforcement, gas metering, host functions (object read/write, crypto, events), bytecode verification at publish | `call(module, func, args, gas)` |
+| **phi-state** | Versioned object store, SMT root computation, snapshots, proofs | `get/put(object)`, `root()`, `prove(id)` |
+| **phi-da** | Blob erasure coding, KZG commitments, availability sampling, archival interface | `publish(blob) -> commitment`, `sample(commitment)` |
+| **phi-types / phi-crypto** | Canonical serialization, hashing (BLAKE3), signatures (Ed25519 now; pluggable), VRF | shared by all |
 
 ## 4. Data Flow Diagrams
 
@@ -66,7 +66,7 @@ The starter repository in this repo implements a vertical slice:
 sequenceDiagram
     participant U as User (passkey)
     participant M as Mempool
-    participant C as Consensus (NexBFT)
+    participant C as Consensus (Cargo)
     participant E as Executor
     participant S as State (SMT)
     participant D as DA layer
@@ -122,5 +122,5 @@ sequenceDiagram
   multi-node network runs in one process with a seeded scheduler so any bug
   reproduces from a seed.
 - Property tests for state transition (serial result == parallel result).
-- Model checking of NexBFT safety in TLA+ before mainnet; Kani proofs for
+- Model checking of Cargo safety in TLA+ before mainnet; Kani proofs for
   resource-type invariants in the stdlib.

@@ -1,14 +1,14 @@
 //! Consensus stub: round-robin proposer with explicit >2/3 voting.
 //!
-//! This models the *shape* of NexBFT (propose → vote → quorum → commit) so
+//! This models the *shape* of Cargo (propose → vote → quorum → commit) so
 //! the rest of the stack integrates against the right interface, while the
 //! real pipelined HotStuff with VRF sortition is built in Phase 1b
 //! (docs/ROADMAP.md). There is no networking, cryptographic signing, or view
 //! change here — validators are honest-by-construction simulation actors that
 //! re-execute proposals and refuse to vote for incorrect state roots.
 
-use nex_state::State;
-use nex_types::{Block, BlockHeader, Hash, Transaction};
+use phi_state::State;
+use phi_types::{Block, BlockHeader, Hash, Transaction};
 
 /// A validator's vote on a proposed block.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -142,7 +142,7 @@ impl ConsensusEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nex_types::AccountId;
+    use phi_types::AccountId;
 
     fn id(label: &str) -> AccountId {
         AccountId::from_label(label)

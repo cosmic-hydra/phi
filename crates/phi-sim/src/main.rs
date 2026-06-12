@@ -1,7 +1,7 @@
-//! Local NexChain simulation: demonstrates transaction processing and
+//! Local Phi simulation: demonstrates transaction processing and
 //! consensus end-to-end with simulated validators.
 //!
-//! Run with: `cargo run -p nex-sim`
+//! Run with: `cargo run -p phi-sim`
 //!
 //! What it shows:
 //! 1. Genesis state with funded accounts.
@@ -13,13 +13,13 @@
 //! 5. Access-set conflict analysis showing the parallelism available to the
 //!    future Block-STM executor.
 
-use nex_consensus::{ConsensusEngine, RoundOutcome};
-use nex_mempool::Mempool;
-use nex_state::State;
-use nex_types::{AccountId, Transaction};
+use phi_consensus::{ConsensusEngine, RoundOutcome};
+use phi_mempool::Mempool;
+use phi_state::State;
+use phi_types::{AccountId, Transaction};
 
 fn main() {
-    println!("=== NexChain local simulation ===\n");
+    println!("=== Phi local simulation ===\n");
 
     // --- Genesis -----------------------------------------------------------
     let alice = AccountId::from_label("alice");

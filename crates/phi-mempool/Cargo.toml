@@ -1,8 +1,9 @@
 [package]
-name = "nex-state"
+name = "phi-mempool"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-nex-types = { workspace = true }
+phi-types = { workspace = true }
+phi-state = { workspace = true }

@@ -10,7 +10,7 @@ impl AccountId {
     /// Derive a deterministic account id from a human label (test/simulation
     /// helper; real accounts derive from auth policy + nonce).
     pub fn from_label(label: &str) -> Self {
-        AccountId(Hash::of_parts(&[b"nex:account", label.as_bytes()]))
+        AccountId(Hash::of_parts(&[b"phi:account", label.as_bytes()]))
     }
 }
 
@@ -24,7 +24,7 @@ impl AccountId {
 pub enum AuthPolicy {
     /// No verification (simulation only).
     Open,
-    /// Single public key (placeholder bytes until nex-crypto lands).
+    /// Single public key (placeholder bytes until phi-crypto lands).
     SingleKey(Vec<u8>),
     /// M-of-N threshold of keys, enabling social recovery.
     Threshold { m: u8, keys: Vec<Vec<u8>> },

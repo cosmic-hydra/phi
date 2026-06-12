@@ -1,9 +1,8 @@
 [package]
-name = "nex-consensus"
+name = "phi-types"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-nex-types = { workspace = true }
-nex-state = { workspace = true }
+blake3 = { workspace = true }

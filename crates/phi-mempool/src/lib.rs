@@ -8,14 +8,14 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use nex_state::State;
-use nex_types::{AccountId, Transaction};
+use phi_state::State;
+use phi_types::{AccountId, Transaction};
 
 /// Why a transaction was refused admission.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AdmissionError {
     /// Stateful validation failed (nonce, balance, unknown sender).
-    Invalid(nex_state::TxError),
+    Invalid(phi_state::TxError),
     /// Free-lane quota exhausted for this sender this block window.
     QuotaExceeded,
     /// Same transaction already pending.
@@ -78,7 +78,7 @@ impl Mempool {
             .map(|a| a.nonce + queued_ahead)
             .unwrap_or(0);
         if state.account(&tx.sender).is_some() && tx.nonce != expected_nonce {
-            return Err(AdmissionError::Invalid(nex_state::TxError::BadNonce {
+            return Err(AdmissionError::Invalid(phi_state::TxError::BadNonce {
                 expected: expected_nonce,
                 got: tx.nonce,
             }));
@@ -125,7 +125,7 @@ impl Mempool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nex_types::AccountId;
+    use phi_types::AccountId;
 
     fn id(label: &str) -> AccountId {
         AccountId::from_label(label)

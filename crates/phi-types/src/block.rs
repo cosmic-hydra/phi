@@ -23,7 +23,7 @@ pub struct BlockHeader {
 impl BlockHeader {
     pub fn hash(&self) -> Hash {
         Hash::of_parts(&[
-            b"nex:header",
+            b"phi:header",
             &self.height.to_le_bytes(),
             self.parent.as_bytes(),
             self.tx_root.as_bytes(),
@@ -53,7 +53,7 @@ impl Block {
                 .chunks(2)
                 .map(|pair| {
                     let right = pair.get(1).unwrap_or(&pair[0]);
-                    Hash::of_parts(&[b"nex:merkle", pair[0].as_bytes(), right.as_bytes()])
+                    Hash::of_parts(&[b"phi:merkle", pair[0].as_bytes(), right.as_bytes()])
                 })
                 .collect();
         }

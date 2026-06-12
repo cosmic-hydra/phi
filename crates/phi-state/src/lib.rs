@@ -1,4 +1,4 @@
-//! NexChain state machine: account store + deterministic state transition.
+//! Phi state machine: account store + deterministic state transition.
 //!
 //! The starter uses an in-memory BTreeMap with a simple sequential-hash
 //! commitment. The production design replaces this with a versioned object
@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use nex_types::{Account, AccountId, Block, Hash, Transaction, TransactionKind};
+use phi_types::{Account, AccountId, Block, Hash, Transaction, TransactionKind};
 
 /// Why a transaction failed the state transition.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,7 +57,7 @@ impl State {
     /// Commitment to the full state. BTreeMap iteration is ordered, so this
     /// is deterministic across nodes. (Production: SMT root.)
     pub fn root(&self) -> Hash {
-        let mut hasher_input: Vec<u8> = b"nex:state".to_vec();
+        let mut hasher_input: Vec<u8> = b"phi:state".to_vec();
         for account in self.accounts.values() {
             hasher_input.extend_from_slice(&account.encode());
         }

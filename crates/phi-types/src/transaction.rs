@@ -31,7 +31,7 @@ pub enum TransactionKind {
     Mint { to: AccountId, amount: u64 },
 }
 
-/// A NexChain transaction.
+/// A Phi transaction.
 ///
 /// Fees: the starter models the free lane only (fee = 0, quota enforcement in
 /// the mempool). `max_fee` is carried so the standard-lane fee market can be
@@ -79,7 +79,7 @@ impl Transaction {
 
     /// Canonical transaction id.
     pub fn id(&self) -> Hash {
-        let mut parts: Vec<Vec<u8>> = vec![b"nex:tx".to_vec()];
+        let mut parts: Vec<Vec<u8>> = vec![b"phi:tx".to_vec()];
         parts.push(self.sender.0.as_bytes().to_vec());
         parts.push(self.nonce.to_le_bytes().to_vec());
         match &self.kind {

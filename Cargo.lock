@@ -72,40 +72,40 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
-name = "nex-consensus"
+name = "phi-consensus"
 version = "0.1.0"
 dependencies = [
- "nex-state",
- "nex-types",
+ "phi-state",
+ "phi-types",
 ]
 
 [[package]]
-name = "nex-mempool"
+name = "phi-mempool"
 version = "0.1.0"
 dependencies = [
- "nex-state",
- "nex-types",
+ "phi-state",
+ "phi-types",
 ]
 
 [[package]]
-name = "nex-sim"
+name = "phi-sim"
 version = "0.1.0"
 dependencies = [
- "nex-consensus",
- "nex-mempool",
- "nex-state",
- "nex-types",
+ "phi-consensus",
+ "phi-mempool",
+ "phi-state",
+ "phi-types",
 ]
 
 [[package]]
-name = "nex-state"
+name = "phi-state"
 version = "0.1.0"
 dependencies = [
- "nex-types",
+ "phi-types",
 ]
 
 [[package]]
-name = "nex-types"
+name = "phi-types"
 version = "0.1.0"
 dependencies = [
  "blake3",

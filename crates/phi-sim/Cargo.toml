@@ -1,0 +1,15 @@
+[package]
+name = "phi-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+phi-types = { workspace = true }
+phi-state = { workspace = true }
+phi-mempool = { workspace = true }
+phi-consensus = { workspace = true }
+
+[[bin]]
+name = "phi-sim"
+path = "src/main.rs"

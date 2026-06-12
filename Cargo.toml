@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/nex-types",
-    "crates/nex-state",
-    "crates/nex-mempool",
-    "crates/nex-consensus",
-    "crates/nex-sim",
+    "crates/phi-types",
+    "crates/phi-state",
+    "crates/phi-mempool",
+    "crates/phi-consensus",
+    "crates/phi-sim",
 ]
 
 [workspace.package]
@@ -15,7 +15,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 blake3 = "1.5"
-nex-types = { path = "crates/nex-types" }
-nex-state = { path = "crates/nex-state" }
-nex-mempool = { path = "crates/nex-mempool" }
-nex-consensus = { path = "crates/nex-consensus" }
+phi-types = { path = "crates/phi-types" }
+phi-state = { path = "crates/phi-state" }
+phi-mempool = { path = "crates/phi-mempool" }
+phi-consensus = { path = "crates/phi-consensus" }
