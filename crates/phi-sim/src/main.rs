@@ -22,9 +22,12 @@
 //!    verified by a light client (no trusted relayer), and a committed lock
 //!    event releases figs from the bridge reserve via consensus — replay of
 //!    the same foreign lock rejected.
-//! 9. A light-client audit: QC chain verification, a Merkle transaction
-//!    inclusion proof, and SMT inclusion/exclusion proofs for accounts.
-//! 10. Serial replay equality: the parallel executor's chain state matches
+//! 9. Smart contracts: a deterministic, gas-metered PhiVM token contract runs
+//!    a transfer and an atomically-reverted overspend (standalone; ledger
+//!    integration is the next step).
+//! 10. A light-client audit: QC chain verification, a Merkle transaction
+//!     inclusion proof, and SMT inclusion/exclusion proofs for accounts.
+//! 11. Serial replay equality: the parallel executor's chain state matches
 //!     byte-for-byte a serial re-execution of every committed block.
 
 use std::collections::HashMap;
@@ -434,6 +437,48 @@ fn main() {
         }
         other => panic!("expected replay rejection, got {other:?}"),
     }
+
+    // --- Smart contracts: PhiVM (deterministic, gas-metered) -------------------
+    // Standalone VM demo: contracts run here but are not yet wired into the
+    // ledger's state transition (the next integration step — see phi-vm docs).
+    println!("--- smart contracts: PhiVM (deterministic, gas-metered) ---");
+    let mut token = phi_vm::Contract::new(phi_vm::token_contract());
+    let (vm_alice, vm_bob) = (0xA11CE_u64, 0xB0B_u64);
+    token.storage.insert(vm_alice, 100); // seed alice with 100 tokens
+    let gas = 10_000;
+    let ok = token
+        .call(
+            &phi_vm::CallContext {
+                caller: vm_alice,
+                args: vec![phi_vm::token::TRANSFER, vm_bob, 30],
+                ..Default::default()
+            },
+            gas,
+        )
+        .unwrap();
+    println!(
+        "  token.transfer(alice->bob, 30) -> ret={:?}, gas_used={}",
+        ok.return_value, ok.gas_used
+    );
+    println!(
+        "  balances: alice={} bob={}",
+        token.storage[&vm_alice], token.storage[&vm_bob]
+    );
+    let before = token.storage.clone();
+    let overspend = token.call(
+        &phi_vm::CallContext {
+            caller: vm_alice,
+            args: vec![phi_vm::token::TRANSFER, vm_bob, 1_000],
+            ..Default::default()
+        },
+        gas,
+    );
+    println!("  token.transfer(alice->bob, 1000) -> {overspend:?} (atomic revert)");
+    assert_eq!(
+        token.storage, before,
+        "reverted call must not change balances"
+    );
+    println!("  contract code hash: {:?}\n", token.code_hash());
 
     // --- Final state ----------------------------------------------------------
     let state = engine.canonical_state();

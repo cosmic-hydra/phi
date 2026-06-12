@@ -114,6 +114,14 @@ sortition ("PhiBFT").
 (inspired by Move) and **object-scoped parallelism** (inspired by Sui/Solana's
 access lists, generalized).
 
+> **Implemented (`phi-vm`):** a self-contained deterministic, gas-metered
+> bytecode VM with the execution-model properties the WASM target needs —
+> integer-only operands, bounded stack, gas-bounded termination, and atomic
+> revert-on-trap — with an example token contract. The WASM core below is the
+> production path; the bytecode VM proves the model without a heavy dependency.
+> Ledger integration (`Deploy`/`Call` tx kinds, contract storage in the SMT)
+> is the next step (docs/ROADMAP.md Phase 2).
+
 - **WASM core:** mature toolchains, sandboxing, metering, multiple source
   languages (Rust first-class; AssemblyScript/Go later). Determinism enforced
   by stripping floats/NaN nondeterminism, fixed memory/page limits, and gas

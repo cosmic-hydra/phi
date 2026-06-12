@@ -36,8 +36,11 @@ faults injected, zero safety violations across 10^6 randomized sim runs.
 
 ## Phase 2 — Minimal viable implementation of key components
 
-1. **PhiVM:** wasmtime embedding, determinism enforcement, gas metering,
-   object host API, bytecode verifier for resource rules.
+1. **PhiVM:** a deterministic, gas-metered bytecode VM is implemented
+   (`phi-vm`: integer-only, bounded stack, atomic revert-on-trap, with a token
+   contract). Remaining: wire it into the ledger (`Deploy`/`Call` tx kinds,
+   contract storage in the SMT, access-set scheduling), then a wasmtime
+   embedding with a bytecode verifier for resource rules.
 2. **Parallel executor:** declared access sets, Block-STM optimistic engine,
    serial-equivalence property tests.
 3. **Native account abstraction:** default account module, passkey (WebAuthn

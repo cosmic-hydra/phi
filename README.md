@@ -31,6 +31,8 @@ crates/
 │                   # certificates, view change, Byzantine validator simulation
 ├── phi-interop/    # trust-minimized cross-chain bridge: pluggable light-client
 │                   # verifiers (PoW + BFT adapters), no multisig bridges
+├── phi-vm/         # PhiVM: deterministic, gas-metered bytecode VM for smart
+│                   # contracts (atomic revert-on-trap, bounded resources)
 └── phi-sim/        # local simulation binary demonstrating the full pipeline
 ```
 
@@ -78,10 +80,12 @@ The simulation demonstrates:
    verified by a light client (no trusted relayer or multisig), and a
    committed lock event releases figs from the bridge reserve through
    consensus — replay of the same foreign lock rejected.
-9. A light-client audit: quorum-certificate verification for the whole chain,
-   a Merkle transaction inclusion proof, and SMT inclusion/exclusion proofs
-   for accounts.
-10. Byte-identical state roots across validators, audited supply, and a
+9. **Smart contracts** on PhiVM: a deterministic, gas-metered token contract
+   runs a transfer and an atomically-reverted overspend.
+10. A light-client audit: quorum-certificate verification for the whole chain,
+    a Merkle transaction inclusion proof, and SMT inclusion/exclusion proofs
+    for accounts.
+11. Byte-identical state roots across validators, audited supply, and a
     serial replay that matches the parallel executor exactly.
 
 ## Interoperability
@@ -94,6 +98,19 @@ families — `PowLightClient` (Bitcoin-style SPV) and `BftLightClient`
 (Tendermint/Cosmos/Solana-style validator sets). Supporting a specific chain
 means implementing the `LightClient` trait for its rules; there is no automatic
 "works with every blockchain" switch, because each chain's finality differs.
+
+## Smart contracts
+
+`phi-vm` is a deterministic, gas-metered bytecode VM — the programmability
+layer that makes Phi a platform rather than a payments ledger. It is
+integer-only (no float nondeterminism), bounded by gas (so every call
+terminates) and stack depth, and calls are atomic (a trap reverts all storage
+writes, like an EVM revert). The spec's long-term target is a WASM VM; this
+self-contained engine proves the execution-model properties (determinism, gas,
+atomicity) without a heavy dependency. It is **not yet wired into the ledger** —
+the next step is `Deploy`/`Call` transaction kinds, contract storage committed
+in the SMT, and access-set declarations so contract calls schedule on the
+parallel executor.
 
 ## Security
 

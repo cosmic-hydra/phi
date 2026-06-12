@@ -45,8 +45,15 @@ are designed-for but **not implemented**, and must not be relied on:
   do SPV/quorum header verification, but ZK-SNARK aggregation, validator-set
   rotation, PoW retargeting / most-work fork choice, and the foreign-side
   release contracts are not implemented. Do not bridge real value on it.
-- **VM-level exploits** — there is no smart-contract VM yet; only fixed
-  transfer/mint transaction kinds.
+  Redemption is two-phase (prepare/confirm) and idempotent via the reserve
+  nonce; fully nonce-independent idempotency would record settled
+  `(chain, sequence)` pairs in consensus state, which is not yet done.
+- **Ledger-integrated VM exploits** — `phi-vm` exists (deterministic,
+  gas-metered, atomic) and is tested in isolation, but it is **not yet wired
+  into the state transition**, so there are no on-chain contract attack
+  surfaces yet. When integrated, it will need a bytecode verifier, gas
+  accounting inside the parallel executor, and reentrancy/attacker-contract
+  analysis — none of which is done.
 - **Side channels, supply-chain, and dependency vulnerabilities.**
 
 ## Honest bottom line
