@@ -12,6 +12,10 @@ use crate::transaction::Transaction;
 /// produced by `phi-consensus` and stored alongside the chain.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockHeader {
+    /// Network this block belongs to. Bound into the header hash — and thus
+    /// into every vote and quorum certificate over it — so consensus
+    /// messages from one Phi instance can never be replayed against another.
+    pub chain_id: u64,
     pub height: u64,
     pub parent: Hash,
     /// Merkle root of transactions in this block.
@@ -31,6 +35,7 @@ impl BlockHeader {
         Hash::of_tagged(
             b"phi:header",
             &[
+                &self.chain_id.to_le_bytes(),
                 &self.height.to_le_bytes(),
                 self.parent.as_bytes(),
                 self.tx_root.as_bytes(),
@@ -109,6 +114,7 @@ mod tests {
         let root = Block::compute_tx_root(&transactions);
         let block = Block {
             header: BlockHeader {
+                chain_id: 0,
                 height: 1,
                 parent: Hash::ZERO,
                 tx_root: root,
@@ -126,8 +132,9 @@ mod tests {
     }
 
     #[test]
-    fn header_hash_commits_to_receipts_root() {
+    fn header_hash_commits_to_receipts_root_and_chain_id() {
         let mut header = BlockHeader {
+            chain_id: 0,
             height: 1,
             parent: Hash::ZERO,
             tx_root: Hash::ZERO,
@@ -139,5 +146,11 @@ mod tests {
         let original = header.hash();
         header.receipts_root = Hash::of(b"different");
         assert_ne!(original, header.hash());
+
+        // The same block on a different network hashes differently, so its
+        // votes and quorum certificate cannot be replayed cross-chain.
+        let mut other_chain = header.clone();
+        other_chain.chain_id = 1;
+        assert_ne!(header.hash(), other_chain.hash());
     }
 }

@@ -29,7 +29,7 @@ use phi_cargo::{FigGovernor, GuardError, PeerId, Throttle, ThrottleConfig};
 use phi_consensus::{ConsensusEngine, RoundOutcome};
 use phi_crypto::Keypair;
 use phi_mempool::{AdmissionError, Mempool};
-use phi_state::State;
+use phi_state::{State, TxError};
 use phi_types::{AccountId, AuthPolicy, Block, Hash, Transaction};
 
 fn main() {
@@ -294,6 +294,7 @@ fn main() {
 
     // --- Cargo guard: fig issuance governance ----------------------------------
     println!("--- cargo guard: fig issuance governance ---");
+    let supply_before_issuance = engine.canonical_state().total_supply();
     let exploit = Transaction::mint(eve, 0, eve, 1_000_000).signed(&eve_kp);
     println!(
         "  edge screen: eve mints herself 1,000,000 figs -> {:?}",
@@ -301,23 +302,29 @@ fn main() {
     );
     println!("  a colluding proposer includes the mint anyway, bypassing the edge:");
     match engine.run_round(vec![exploit], 1_700_000_003_000) {
-        RoundOutcome::Rejected {
-            proposer,
-            approvals,
-            needed,
-            ..
-        } => println!(
-            "  REJECTED: proposer {proposer} got {approvals}/{needed} — the bare state \
-             machine accepted the mint;\n  the Cargo audit refused it quorum (issuance is frozen)"
-        ),
-        RoundOutcome::Committed { .. } => panic!("unauthorized issuance must never commit"),
+        RoundOutcome::Committed {
+            block, receipts, ..
+        } => {
+            // Defense in depth: the base ledger rejects the unauthorized mint
+            // (recorded as a failed receipt), so the block commits with NO
+            // figs created. The Cargo supply audit independently confirms it.
+            assert_eq!(receipts[0].result, Err(TxError::UnauthorizedIssuance));
+            assert_eq!(
+                engine.canonical_state().total_supply(),
+                supply_before_issuance
+            );
+            println!(
+                "  COMMITTED block #{} but the mint FAILED ({:?}) — supply unchanged at {} figs",
+                block.header.height,
+                receipts[0].result.as_ref().unwrap_err(),
+                engine.canonical_state().total_supply()
+            );
+        }
+        RoundOutcome::Rejected { .. } => panic!("block with a failed tx should still commit"),
     }
 
-    println!("  governance designates alice as treasury (cap 1000 figs/block):");
-    engine.set_governor(FigGovernor {
-        minter: Some(alice),
-        max_mint_per_block: 1_000,
-    });
+    println!("  governance grants alice issuance authority (cap 1000 figs/block):");
+    engine.set_issuance_authority(alice, 1_000);
     match engine.run_round(
         vec![Transaction::mint(alice, 3, dave, 100).signed(&alice_kp)],
         1_700_000_003_500,
@@ -411,7 +418,12 @@ fn main() {
     println!("  SMT exclusion proof: 'mallory' provably has no account ✓");
 
     // --- Serial replay equivalence ----------------------------------------------
+    // A fresh node re-validating the chain must reach the same state. It also
+    // needs the governance-set issuance authority: granting it is an
+    // out-of-band engine action here (not yet a transaction), so we configure
+    // the replay with the same final authority before replaying.
     let mut replay = genesis;
+    replay.set_minter(Some(alice));
     for (block, _) in &engine.chain {
         let receipts = replay.apply_block(block);
         assert_eq!(

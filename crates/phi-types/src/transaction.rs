@@ -96,6 +96,12 @@ impl AuthReveal {
 pub struct Transaction {
     pub sender: AccountId,
     pub nonce: u64,
+    /// Network this transaction is valid on. Bound into [`Transaction::id`]
+    /// (and therefore into the signed message), so a transaction signed for
+    /// one Phi instance cannot be replayed onto another — the classic
+    /// cross-chain replay attack (cf. Ethereum EIP-155). The state machine
+    /// rejects transactions whose `chain_id` does not match its own.
+    pub chain_id: u64,
     pub kind: TransactionKind,
     pub access: AccessSet,
     pub max_fee: u64,
@@ -127,6 +133,7 @@ impl Transaction {
         Self {
             sender,
             nonce,
+            chain_id: 0,
             kind,
             access: AccessSet {
                 reads: vec![],
@@ -137,6 +144,13 @@ impl Transaction {
             auth_reveal: None,
             signatures: vec![],
         }
+    }
+
+    /// Bind this transaction to a specific network (builder; call before
+    /// signing — `chain_id` is covered by the id).
+    pub fn with_chain_id(mut self, chain_id: u64) -> Self {
+        self.chain_id = chain_id;
+        self
     }
 
     /// Attach the first-spend auth reveal (builder; call before signing —
@@ -177,6 +191,7 @@ impl Transaction {
         Hash::of_tagged(
             b"phi:tx",
             &[
+                &self.chain_id.to_le_bytes(),
                 self.sender.0.as_bytes(),
                 &self.nonce.to_le_bytes(),
                 &self.kind.encode(),
@@ -209,6 +224,7 @@ mod tests {
         sponsor_changed.sponsor = Some(id("s"));
         let reveal_changed = base.clone().with_reveal(AuthPolicy::Open, 0);
         let kind_changed = Transaction::mint(id("a"), 0, id("b"), 10);
+        let chain_changed = base.clone().with_chain_id(1);
 
         let ids = [
             base.id(),
@@ -217,6 +233,7 @@ mod tests {
             sponsor_changed.id(),
             reveal_changed.id(),
             kind_changed.id(),
+            chain_changed.id(),
         ];
         for (i, a) in ids.iter().enumerate() {
             for b in ids.iter().skip(i + 1) {

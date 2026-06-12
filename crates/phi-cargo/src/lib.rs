@@ -371,12 +371,16 @@ mod tests {
             .is_err());
     }
 
-    /// Execute `txs` serially and audit the block with `governor`.
+    /// Execute `txs` serially and audit the block with `governor`. Aligns the
+    /// base-ledger issuance authority with the governor so authorized mints
+    /// actually execute (the two layers move together in production via
+    /// `ConsensusEngine::set_issuance_authority`).
     fn run_audit(
         governor: &FigGovernor,
         state: &mut State,
         txs: &[Transaction],
     ) -> Result<(), AuditViolation> {
+        state.set_minter(governor.minter);
         let pre = state.total_supply();
         let receipts: Vec<Receipt> = txs.iter().map(|tx| state.apply_tx(tx)).collect();
         governor.audit_block(pre, state.total_supply(), txs, &receipts)
@@ -400,13 +404,22 @@ mod tests {
     }
 
     #[test]
-    fn audit_catches_unauthorized_mint_the_state_machine_accepts() {
-        // The bare state machine happily lets eve mint to herself — exactly
-        // the hole Cargo closes at the voting stage.
-        let mut state = State::new();
-        state.genesis_account(id("eve"), 5);
-        let txs = vec![Transaction::mint(id("eve"), 0, id("eve"), 1_000_000)];
-        let outcome = run_audit(&FigGovernor::default(), &mut state, &txs);
+    fn audit_is_independent_defense_against_a_slipped_unauthorized_mint() {
+        // The base ledger now rejects unauthorized mints itself (see
+        // phi-state). The audit is the *second* layer: even if a buggy or
+        // malicious execution path marked an unauthorized mint as
+        // successful, the audit catches it. We construct that receipt
+        // directly to exercise the audit in isolation.
+        let governor = FigGovernor {
+            minter: Some(id("treasury")),
+            max_mint_per_block: 1_000,
+        };
+        let forged = Transaction::mint(id("eve"), 0, id("eve"), 1_000_000);
+        let receipts = vec![Receipt {
+            tx_id: forged.id(),
+            result: Ok(()), // pretend execution wrongly accepted it
+        }];
+        let outcome = governor.audit_block(0, 1_000_000, std::slice::from_ref(&forged), &receipts);
         assert!(matches!(
             outcome,
             Err(AuditViolation::UnauthorizedMint { .. })

@@ -27,10 +27,24 @@ pub enum TxError {
         expected: u64,
         got: u64,
     },
+    /// Transaction's `chain_id` does not match this network's. Blocks
+    /// cross-chain / cross-instance replay of signed transactions.
+    WrongChain {
+        expected: u64,
+        got: u64,
+    },
+    /// Structurally oversized (access set, signatures, or revealed key list
+    /// beyond protocol limits). Rejected before any signature work so a
+    /// single transaction cannot exhaust validator CPU.
+    TransactionTooLarge,
     /// The transaction touches state outside its declared access set.
     AccessViolation,
     /// Signatures do not satisfy the sender's auth policy.
     AuthFailed,
+    /// A mint from an account that is not this network's issuance authority
+    /// (or issuance is frozen). Enforced by the base ledger itself, not only
+    /// by the Cargo guard's block audit.
+    UnauthorizedIssuance,
     /// Spending from an unclaimed account requires revealing the auth policy
     /// committed to by the account id; the reveal is missing or mismatched
     /// (or present on an already-claimed account).
@@ -72,8 +86,28 @@ impl TxError {
                 out
             }
             TxError::Overflow => vec![7],
+            TxError::WrongChain { expected, got } => {
+                let mut out = vec![8];
+                out.extend_from_slice(&expected.to_le_bytes());
+                out.extend_from_slice(&got.to_le_bytes());
+                out
+            }
+            TxError::TransactionTooLarge => vec![9],
+            TxError::UnauthorizedIssuance => vec![10],
         }
     }
+}
+
+/// Protocol limits enforced as consensus rules (see [`State::check_limits`]).
+/// They bound the work a single transaction can force a validator to do, so
+/// no transaction can exhaust memory or CPU regardless of who signs it.
+pub mod limits {
+    /// Max combined entries (reads + writes) in a transaction's access set.
+    pub const MAX_ACCESS_ENTRIES: usize = 64;
+    /// Max signatures a transaction may carry (bounds threshold-auth work).
+    pub const MAX_SIGNATURES: usize = 16;
+    /// Max keys in a revealed (attacker-supplied) threshold auth policy.
+    pub const MAX_THRESHOLD_KEYS: usize = 16;
 }
 
 /// Per-transaction outcome included in execution receipts.
@@ -101,9 +135,16 @@ pub fn receipts_root(receipts: &[Receipt]) -> Hash {
 }
 
 /// The ledger state.
+///
+/// Beyond the account map, `State` carries two consensus parameters that make
+/// the base ledger safe in isolation (not only behind the Cargo guard):
+/// `chain_id` (rejects foreign-network transactions) and `minter` (the sole
+/// account permitted to create figs; `None` freezes issuance entirely).
 #[derive(Clone, Debug, Default)]
 pub struct State {
     accounts: BTreeMap<AccountId, Account>,
+    chain_id: u64,
+    minter: Option<AccountId>,
 }
 
 fn account_value_hash(account: &Account) -> Hash {
@@ -113,6 +154,40 @@ fn account_value_hash(account: &Account) -> Hash {
 impl State {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// This network's id. Transactions must carry a matching `chain_id`.
+    pub fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
+    /// Set the network id (consensus parameter; set at genesis).
+    pub fn set_chain_id(&mut self, chain_id: u64) {
+        self.chain_id = chain_id;
+    }
+
+    /// An empty state carrying the same consensus configuration (`chain_id`,
+    /// `minter`) but no accounts. The parallel executor builds per-transaction
+    /// sandboxes from this so validation inside a sandbox sees the same
+    /// issuance authority and network id as the real ledger.
+    pub fn empty_like(&self) -> Self {
+        Self {
+            accounts: BTreeMap::new(),
+            chain_id: self.chain_id,
+            minter: self.minter,
+        }
+    }
+
+    /// The account authorized to mint figs (`None` = issuance frozen).
+    pub fn minter(&self) -> Option<AccountId> {
+        self.minter
+    }
+
+    /// Set (or clear) the issuance authority. In production this tracks
+    /// on-chain governance; the Cargo guard's per-block cap and supply audit
+    /// layer on top of this base-ledger rule.
+    pub fn set_minter(&mut self, minter: Option<AccountId>) {
+        self.minter = minter;
     }
 
     /// Create an `Open`-auth account with an initial balance (genesis/test
@@ -178,8 +253,40 @@ impl State {
         smt::verify(state_root, id.0.as_bytes(), value_hash.as_ref(), proof)
     }
 
+    /// Structural sanity bounds, enforced before any state lookup or
+    /// signature work so a single malformed transaction cannot exhaust a
+    /// validator's CPU or memory. A consensus rule: deterministic, no state
+    /// dependence, so every node agrees.
+    pub fn check_limits(tx: &Transaction) -> Result<(), TxError> {
+        if tx.access.reads.len() + tx.access.writes.len() > limits::MAX_ACCESS_ENTRIES {
+            return Err(TxError::TransactionTooLarge);
+        }
+        if tx.signatures.len() > limits::MAX_SIGNATURES {
+            return Err(TxError::TransactionTooLarge);
+        }
+        // An attacker-supplied first-spend reveal could otherwise carry an
+        // enormous threshold key list, blowing up auth verification.
+        if let Some(reveal) = &tx.auth_reveal {
+            if let AuthPolicy::Threshold { keys, .. } = &reveal.policy {
+                if keys.len() > limits::MAX_THRESHOLD_KEYS {
+                    return Err(TxError::TransactionTooLarge);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Validate a transaction against current state without applying it.
     pub fn validate(&self, tx: &Transaction) -> Result<(), TxError> {
+        // Cheapest, state-independent checks first.
+        Self::check_limits(tx)?;
+        if tx.chain_id != self.chain_id {
+            return Err(TxError::WrongChain {
+                expected: self.chain_id,
+                got: tx.chain_id,
+            });
+        }
+
         let sender = self
             .accounts
             .get(&tx.sender)
@@ -221,6 +328,12 @@ impl State {
                 }
             }
             TransactionKind::Mint { to, amount } => {
+                // Base-ledger issuance authority: only the configured minter
+                // may create figs. The Cargo guard's per-block cap and
+                // supply-conservation audit are a second, independent layer.
+                if self.minter != Some(tx.sender) {
+                    return Err(TxError::UnauthorizedIssuance);
+                }
                 self.balance(to)
                     .checked_add(*amount)
                     .ok_or(TxError::Overflow)?;
@@ -299,7 +412,9 @@ impl State {
         }
         if consume_nonce {
             let sender = self.accounts.get_mut(&tx.sender).expect("validated sender");
-            sender.nonce += 1;
+            // Nonce overflow is unreachable in practice (2^64 txs); fail
+            // closed rather than wrap, which would re-enable replay.
+            sender.nonce = sender.nonce.checked_add(1).expect("nonce overflow");
         }
         Receipt {
             tx_id: tx.id(),
@@ -308,7 +423,10 @@ impl State {
     }
 
     /// Apply a fully validated transaction. Infallible: every failure mode
-    /// was pre-checked, so state can never be left half-mutated.
+    /// was pre-checked in [`State::validate`]. Arithmetic uses checked ops
+    /// anyway — if validation and execution ever drifted, we halt (panic)
+    /// rather than silently wrap and corrupt the supply, honoring the
+    /// protocol's safety-over-liveness stance.
     fn execute(&mut self, tx: &Transaction) {
         // First spend from an unclaimed account stores the revealed policy.
         if let Some(reveal) = &tx.auth_reveal {
@@ -318,19 +436,28 @@ impl State {
         match &tx.kind {
             TransactionKind::Transfer { to, amount } => {
                 let sender = self.accounts.get_mut(&tx.sender).expect("validated sender");
-                sender.balance -= amount;
+                sender.balance = sender
+                    .balance
+                    .checked_sub(*amount)
+                    .expect("validated: sufficient balance");
                 let recipient = self
                     .accounts
                     .entry(*to)
                     .or_insert_with(|| Account::with_auth(*to, 0, AuthPolicy::Unclaimed));
-                recipient.balance += amount;
+                recipient.balance = recipient
+                    .balance
+                    .checked_add(*amount)
+                    .expect("validated: recipient credit does not overflow");
             }
             TransactionKind::Mint { to, amount } => {
                 let recipient = self
                     .accounts
                     .entry(*to)
                     .or_insert_with(|| Account::with_auth(*to, 0, AuthPolicy::Unclaimed));
-                recipient.balance += amount;
+                recipient.balance = recipient
+                    .balance
+                    .checked_add(*amount)
+                    .expect("validated: mint credit does not overflow");
             }
         }
     }
@@ -630,6 +757,90 @@ mod tests {
             Some(&Account::new(id("mallory"), 9)),
             &mallory_proof
         ));
+    }
+
+    #[test]
+    fn unauthorized_mint_rejected_by_base_ledger() {
+        // The core fix: minting is not a free-for-all. With issuance frozen
+        // (default) nobody can mint; once an authority is set, only it can.
+        let mut state = State::new();
+        state.genesis_account(id("eve"), 5);
+        let mint = Transaction::mint(id("eve"), 0, id("eve"), 1_000_000);
+        assert_eq!(
+            state.apply_tx(&mint).result,
+            Err(TxError::UnauthorizedIssuance)
+        );
+        assert_eq!(state.total_supply(), 5, "no figs created");
+        assert_eq!(
+            state.account(&id("eve")).unwrap().nonce,
+            0,
+            "policy reject keeps nonce"
+        );
+
+        state.set_minter(Some(id("treasury")));
+        state.genesis_account(id("treasury"), 0);
+        // Eve still cannot mint; only the treasury can.
+        assert_eq!(
+            state
+                .apply_tx(&Transaction::mint(id("eve"), 0, id("eve"), 100))
+                .result,
+            Err(TxError::UnauthorizedIssuance)
+        );
+        assert!(state
+            .apply_tx(&Transaction::mint(id("treasury"), 0, id("alice"), 100))
+            .result
+            .is_ok());
+        assert_eq!(state.total_supply(), 105);
+    }
+
+    #[test]
+    fn wrong_chain_transaction_rejected() {
+        let mut state = State::new();
+        state.set_chain_id(1);
+        state.genesis_account(id("alice"), 100);
+        let foreign = Transaction::transfer(id("alice"), 0, id("bob"), 1).with_chain_id(2);
+        assert_eq!(
+            state.apply_tx(&foreign).result,
+            Err(TxError::WrongChain {
+                expected: 1,
+                got: 2
+            })
+        );
+        // A signed transaction for chain 2 has a different id on chain 1, so
+        // it cannot be replayed here even with a valid signature.
+        assert_eq!(state.balance(&id("alice")), 100);
+        assert_eq!(state.account(&id("alice")).unwrap().nonce, 0);
+    }
+
+    #[test]
+    fn oversized_transactions_rejected_before_auth_work() {
+        let mut state = State::new();
+        state.genesis_account(id("alice"), 100);
+
+        let mut huge_access = Transaction::transfer(id("alice"), 0, id("bob"), 1);
+        huge_access.access.writes = (0..limits::MAX_ACCESS_ENTRIES + 1)
+            .map(|i| id(&format!("acct-{i}")))
+            .collect();
+        assert_eq!(
+            state.apply_tx(&huge_access).result,
+            Err(TxError::TransactionTooLarge)
+        );
+
+        let mut many_sigs = Transaction::transfer(id("alice"), 0, id("bob"), 1);
+        many_sigs.signatures = vec![nex_signature_placeholder(); limits::MAX_SIGNATURES + 1];
+        assert_eq!(
+            state.apply_tx(&many_sigs).result,
+            Err(TxError::TransactionTooLarge)
+        );
+        assert_eq!(
+            state.account(&id("alice")).unwrap().nonce,
+            0,
+            "no nonce burn"
+        );
+    }
+
+    fn nex_signature_placeholder() -> phi_crypto::Signature {
+        phi_crypto::Signature([0u8; phi_crypto::SIGNATURE_LEN])
     }
 
     #[test]

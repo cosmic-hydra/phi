@@ -351,6 +351,20 @@ infeasible with or without Cargo. What Cargo removes is the cheap spam/probe
 surface, and what its audits add are invariant tripwires enforced before
 quorum — defense in depth around the cryptography, not a replacement for it.
 
+### Implemented hardening (and its limits)
+
+The current code enforces, with tests: base-ledger issuance authority
+(unauthorized mints rejected by the state machine itself, not only by Cargo);
+`chain_id` binding on transactions and block headers (cross-chain replay
+protection); bounded access-set/signature/key sizes (CPU-exhaustion limits);
+a global mempool capacity (memory limit); distinct-signer threshold and quorum
+checks; checked arithmetic that halts rather than wrapping; and SMT
+inclusion/exclusion proofs. **This does not make Phi "unhackable."**
+[`SECURITY.md`](../SECURITY.md) is the authoritative, honest threat model: it
+lists exactly what is enforced and the substantial surface (real networking,
+slashing, key management, formal verification, audits) that a production
+deployment still requires.
+
 ---
 
 ## 13. How Phi Patches Each of the 10 Issues

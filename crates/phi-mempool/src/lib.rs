@@ -13,13 +13,21 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use phi_state::State;
 use phi_types::{AccountId, Hash, Transaction, TransactionKind};
 
+/// Default global capacity: maximum transactions held pending across all
+/// senders. Bounds mempool memory so a flood of distinct senders cannot
+/// exhaust it.
+pub const DEFAULT_MAX_PENDING: usize = 100_000;
+
 /// Why a transaction was refused admission.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AdmissionError {
-    /// Stateful validation failed (nonce, balance, auth, unknown sender).
+    /// Stateful validation failed (nonce, balance, auth, unknown sender,
+    /// wrong chain, oversized, unauthorized issuance).
     Invalid(phi_state::TxError),
     /// Free-lane quota exhausted for this sender this block window.
     QuotaExceeded,
+    /// Global mempool capacity reached.
+    Full,
     /// Same transaction already pending.
     Duplicate,
 }
@@ -52,6 +60,8 @@ pub struct Mempool {
     window_usage: HashMap<AccountId, u32>,
     /// Max free transactions per sender per window.
     pub quota_per_window: u32,
+    /// Global capacity across all senders (memory-exhaustion bound).
+    pub max_pending: usize,
 }
 
 impl Default for Mempool {
@@ -62,12 +72,18 @@ impl Default for Mempool {
 
 impl Mempool {
     pub fn new(quota_per_window: u32) -> Self {
+        Self::with_capacity(quota_per_window, DEFAULT_MAX_PENDING)
+    }
+
+    /// Construct with an explicit global capacity.
+    pub fn with_capacity(quota_per_window: u32, max_pending: usize) -> Self {
         Self {
             queue: VecDeque::new(),
             pending_ids: HashSet::new(),
             per_sender: HashMap::new(),
             window_usage: HashMap::new(),
             quota_per_window,
+            max_pending,
         }
     }
 
@@ -107,6 +123,15 @@ impl Mempool {
     /// including auth; deeper-queued ones are admitted on projection and
     /// re-checked at execution.
     pub fn submit(&mut self, tx: Transaction, state: &State) -> Result<(), AdmissionError> {
+        // Structural bounds first — before hashing the id or any state work —
+        // so an oversized transaction can't make us do expensive work just to
+        // reject it.
+        State::check_limits(&tx).map_err(AdmissionError::Invalid)?;
+
+        if self.queue.len() >= self.max_pending {
+            return Err(AdmissionError::Full);
+        }
+
         if self.pending_ids.contains(&tx.id()) {
             return Err(AdmissionError::Duplicate);
         }
@@ -212,6 +237,37 @@ mod tests {
             pool.submit(Transaction::transfer(id("alice"), 5, id("bob"), 1), &state),
             Err(AdmissionError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn global_capacity_bounds_memory() {
+        let state = funded_state();
+        // Generous per-sender quota but a tiny global cap.
+        let mut pool = Mempool::with_capacity(1000, 2);
+        assert!(pool
+            .submit(Transaction::transfer(id("alice"), 0, id("bob"), 1), &state)
+            .is_ok());
+        assert!(pool
+            .submit(Transaction::transfer(id("alice"), 1, id("bob"), 1), &state)
+            .is_ok());
+        assert_eq!(
+            pool.submit(Transaction::transfer(id("alice"), 2, id("bob"), 1), &state),
+            Err(AdmissionError::Full)
+        );
+    }
+
+    #[test]
+    fn oversized_transaction_rejected_at_admission() {
+        let state = funded_state();
+        let mut pool = Mempool::new(16);
+        let mut huge = Transaction::transfer(id("alice"), 0, id("bob"), 1);
+        huge.access.writes = (0..200).map(|i| id(&format!("a-{i}"))).collect();
+        assert_eq!(
+            pool.submit(huge, &state),
+            Err(AdmissionError::Invalid(
+                phi_state::TxError::TransactionTooLarge
+            ))
+        );
     }
 
     #[test]

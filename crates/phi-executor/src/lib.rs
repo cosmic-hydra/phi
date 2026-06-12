@@ -86,7 +86,9 @@ pub fn execute(state: &mut State, txs: &[Transaction]) -> ExecutionOutput {
         let jobs: Vec<(usize, State)> = group
             .iter()
             .map(|&i| {
-                let mut sandbox = State::new();
+                // Inherit the ledger's consensus config (chain_id, minter) so
+                // sandboxed validation matches the real state exactly.
+                let mut sandbox = state.empty_like();
                 for id in touchable_accounts(&txs[i]) {
                     if let Some(account) = state.account(&id) {
                         sandbox.upsert_account(account.clone());
@@ -184,6 +186,42 @@ mod tests {
             state_root: state.root(),
             receipts,
         }
+    }
+
+    #[test]
+    fn sandboxes_inherit_chain_id_and_minter_from_the_ledger() {
+        // Regression: sandboxes were built with State::new(), dropping the
+        // ledger's consensus config, so authorized mints failed and a
+        // non-zero chain_id rejected its own transactions inside the
+        // executor — diverging from serial execution.
+        let mut state = State::new();
+        state.set_chain_id(42);
+        state.set_minter(Some(id("treasury")));
+        state.genesis_account(id("treasury"), 0);
+        state.genesis_account(id("alice"), 0); // Open auth, can spend unsigned
+
+        let txs = vec![
+            Transaction::mint(id("treasury"), 0, id("alice"), 500).with_chain_id(42),
+            Transaction::transfer(id("alice"), 0, id("bob"), 200).with_chain_id(42),
+        ];
+        let mut serial_state = state.clone();
+        let expected = serial(&mut serial_state, &txs);
+        let actual = execute(&mut state, &txs);
+        assert_eq!(expected, actual);
+        assert!(actual.receipts.iter().all(|r| r.result.is_ok()));
+        assert_eq!(state.balance(&id("bob")), 200);
+
+        // A transaction for the wrong network fails inside the sandbox too.
+        let wrong_chain =
+            vec![Transaction::mint(id("treasury"), 1, id("alice"), 1).with_chain_id(7)];
+        let out = execute(&mut state, &wrong_chain);
+        assert_eq!(
+            out.receipts[0].result,
+            Err(phi_state::TxError::WrongChain {
+                expected: 42,
+                got: 7
+            })
+        );
     }
 
     #[test]

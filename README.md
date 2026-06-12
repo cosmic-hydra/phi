@@ -78,6 +78,15 @@ The simulation demonstrates:
 9. Byte-identical state roots across validators, audited supply, and a
    serial replay that matches the parallel executor exactly.
 
+## Security
+
+The base ledger enforces issuance authority, `chain_id` replay protection,
+bounded transaction sizes, checked arithmetic, and signed/quorum-verified
+consensus — each backed by tests. None of this makes Phi "unhackable."
+[SECURITY.md](SECURITY.md) is the honest threat model: what is enforced today,
+and the substantial surface (real networking, slashing, key management, audits,
+formal verification) a production deployment still requires.
+
 ## License
 
 MIT OR Apache-2.0

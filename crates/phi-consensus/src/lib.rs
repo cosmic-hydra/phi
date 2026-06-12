@@ -15,7 +15,7 @@ use phi_cargo::FigGovernor;
 use phi_crypto::{Keypair, PublicKey, Signature};
 use phi_executor::ExecutionOutput;
 use phi_state::{receipts_root, Receipt, State};
-use phi_types::{Block, BlockHeader, Hash, Transaction};
+use phi_types::{AccountId, Block, BlockHeader, Hash, Transaction};
 
 /// Canonical message a validator signs when voting on a proposal.
 pub fn vote_message(block_hash: &Hash, height: u64, approve: bool) -> Hash {
@@ -142,7 +142,8 @@ impl Validator {
     /// checking every header commitment (txs, state, receipts), and running
     /// the Cargo guard audit — a block that inflates fig supply or mints
     /// without authority is refused even though its roots are self-
-    /// consistent.
+    /// consistent. A block for the wrong network or one exceeding the
+    /// per-block transaction limit is refused outright.
     pub fn vote(&self, block: &Block) -> Vote {
         let approve = if self.byzantine {
             true // votes blindly for anything, including corrupt proposals
@@ -150,7 +151,9 @@ impl Validator {
             let pre_supply = self.state.total_supply();
             let mut scratch = self.state.clone();
             let out = phi_executor::execute(&mut scratch, &block.transactions);
-            Block::compute_tx_root(&block.transactions) == block.header.tx_root
+            block.header.chain_id == self.state.chain_id()
+                && block.transactions.len() <= MAX_BLOCK_TXS
+                && Block::compute_tx_root(&block.transactions) == block.header.tx_root
                 && out.state_root == block.header.state_root
                 && receipts_root(&out.receipts) == block.header.receipts_root
                 && self
@@ -182,11 +185,18 @@ impl Validator {
     }
 }
 
+/// Upper bound on transactions in a single block. Validators refuse to
+/// approve a proposal exceeding it, so a malicious proposer cannot force the
+/// network to re-execute an unbounded block.
+pub const MAX_BLOCK_TXS: usize = 10_000;
+
 /// Round-based BFT-shaped consensus over a set of simulated validators.
 pub struct ConsensusEngine {
     pub validators: Vec<Validator>,
     pub height: u64,
     pub parent: Hash,
+    /// Network id; stamped into every proposed header and checked by voters.
+    pub chain_id: u64,
     /// Monotonic view number; the proposer rotates with it, so a rejected
     /// round moves past a faulty proposer instead of retrying it forever.
     pub view: u64,
@@ -196,8 +206,15 @@ pub struct ConsensusEngine {
 }
 
 impl ConsensusEngine {
-    /// All validators start from the same genesis state.
+    /// All validators start from the same genesis state. The engine inherits
+    /// the genesis network id.
+    ///
+    /// Panics if `num_validators == 0`: a chain with no validators has no
+    /// quorum and no proposer — a configuration bug, not a runtime condition
+    /// to tolerate.
     pub fn new(num_validators: u32, genesis: State) -> Self {
+        assert!(num_validators > 0, "a consensus engine needs >=1 validator");
+        let chain_id = genesis.chain_id();
         let validators = (0..num_validators)
             .map(|i| Validator::new(i, genesis.clone()))
             .collect();
@@ -205,6 +222,7 @@ impl ConsensusEngine {
             validators,
             height: 0,
             parent: Hash::ZERO,
+            chain_id,
             view: 0,
             chain: Vec::new(),
         }
@@ -241,6 +259,7 @@ impl ConsensusEngine {
         }
         Block {
             header: BlockHeader {
+                chain_id: self.chain_id,
                 height: self.height + 1,
                 parent: self.parent,
                 tx_root: Block::compute_tx_root(&txs),
@@ -311,6 +330,21 @@ impl ConsensusEngine {
     pub fn set_governor(&mut self, governor: FigGovernor) {
         for validator in self.validators.iter_mut() {
             validator.governor = governor.clone();
+        }
+    }
+
+    /// Grant fig issuance authority to `minter` with a per-block `cap`,
+    /// consistently across both enforcement layers: the base-ledger rule
+    /// (`State::set_minter`, which makes mints from anyone else fail) and the
+    /// Cargo guard's block audit (cap + supply conservation). Models a
+    /// governance action; both layers move together so they never drift.
+    pub fn set_issuance_authority(&mut self, minter: AccountId, cap: u64) {
+        for validator in self.validators.iter_mut() {
+            validator.state.set_minter(Some(minter));
+            validator.governor = FigGovernor {
+                minter: Some(minter),
+                max_mint_per_block: cap,
+            };
         }
     }
 
@@ -476,28 +510,27 @@ mod tests {
     }
 
     #[test]
-    fn cargo_audit_blocks_unauthorized_mint_until_governance_allows_it() {
+    fn unauthorized_mint_rejected_by_ledger_then_allowed_after_governance() {
         let mut engine = ConsensusEngine::new(4, genesis());
         let supply_before = engine.canonical_state().total_supply();
 
-        // The bare state machine accepts this mint (alice authorizes her own
-        // transaction), so every validator's re-executed roots match the
-        // proposal — only the Cargo audit stands between the exploit and
-        // quorum.
+        // Issuance is frozen by default. Eve's self-mint is rejected by the
+        // base ledger itself: validators re-execute, get a failed receipt,
+        // and the block commits with no figs created (supply unchanged).
         let exploit = vec![Transaction::mint(id("alice"), 0, id("alice"), 1_000_000)];
-        match engine.run_round(exploit, 1) {
-            RoundOutcome::Rejected { approvals, .. } => assert_eq!(approvals, 0),
-            other => panic!("expected rejection, got {other:?}"),
-        }
+        let RoundOutcome::Committed { receipts, .. } = engine.run_round(exploit, 1) else {
+            panic!("expected commit with a failed mint receipt");
+        };
+        assert_eq!(
+            receipts[0].result,
+            Err(phi_state::TxError::UnauthorizedIssuance)
+        );
         assert_eq!(engine.canonical_state().total_supply(), supply_before);
 
-        // Governance designates alice as minter with a cap: the same shape
-        // of transaction now commits, and the audit verifies the supply
-        // delta equals the authorized issuance exactly.
-        engine.set_governor(FigGovernor {
-            minter: Some(id("alice")),
-            max_mint_per_block: 1_000_000,
-        });
+        // Governance grants alice issuance authority across both layers; the
+        // mint now executes and the Cargo audit verifies the supply delta.
+        // (The earlier rejection didn't consume alice's nonce, so it's still 0.)
+        engine.set_issuance_authority(id("alice"), 1_000_000);
         let RoundOutcome::Committed { receipts, .. } = engine.run_round(
             vec![Transaction::mint(id("alice"), 0, id("alice"), 1_000_000)],
             2,
@@ -509,5 +542,33 @@ mod tests {
             engine.canonical_state().total_supply(),
             supply_before + 1_000_000
         );
+    }
+
+    #[test]
+    fn empty_validator_set_is_rejected() {
+        let result = std::panic::catch_unwind(|| ConsensusEngine::new(0, genesis()));
+        assert!(result.is_err(), "zero validators must not construct");
+    }
+
+    #[test]
+    fn within_bounds_block_is_approved() {
+        // Complements the wrong-chain test: an honest, in-bounds block is
+        // approved. (The MAX_BLOCK_TXS rejection path is a single length
+        // comparison in vote(); building 10k+ txs to exercise it would only
+        // test the executor's throughput, not the bound.)
+        let engine = ConsensusEngine::new(4, genesis());
+        let block = engine.propose(vec![Transaction::transfer(id("alice"), 0, id("bob"), 1)], 1);
+        assert!(block.transactions.len() <= MAX_BLOCK_TXS);
+        assert!(engine.validators[1].vote(&block).approve);
+    }
+
+    #[test]
+    fn wrong_chain_block_is_refused_by_voters() {
+        let engine = ConsensusEngine::new(4, genesis());
+        let mut block =
+            engine.propose(vec![Transaction::transfer(id("alice"), 0, id("bob"), 1)], 1);
+        // Re-stamp the header for a different network; honest voters refuse.
+        block.header.chain_id = 999;
+        assert!(!engine.validators[1].vote(&block).approve);
     }
 }
