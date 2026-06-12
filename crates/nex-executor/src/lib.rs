@@ -122,6 +122,10 @@ pub fn execute(state: &mut State, txs: &[Transaction]) -> ExecutionOutput {
 }
 
 /// Run the wave's jobs, spreading them over the available cores.
+///
+/// Scoped spawns keep the starter dependency-free; per-wave thread startup
+/// costs more than executing a small wave, so the Phase-2 engine replaces
+/// this with a persistent worker pool fed by the same wave schedule.
 fn run_jobs(jobs: Vec<(usize, State)>, txs: &[Transaction]) -> Vec<(usize, State, Receipt)> {
     let run = |(i, mut sandbox): (usize, State)| {
         let receipt = sandbox.apply_tx(&txs[i]);

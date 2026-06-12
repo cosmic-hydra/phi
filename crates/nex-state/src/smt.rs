@@ -79,7 +79,10 @@ pub struct SmtProof {
 
 /// Build the (in|ex)clusion proof for `key`.
 pub fn prove(entries: &BTreeMap<Key, Hash>, key: &Key) -> SmtProof {
-    let mut slice: Vec<(&Key, &Hash)> = entries.iter().collect();
+    let flat: Vec<(&Key, &Hash)> = entries.iter().collect();
+    // Walk down the key's path narrowing a borrowed window — no per-level
+    // copies of the entry list.
+    let mut slice: &[(&Key, &Hash)] = &flat;
     let mut siblings = Vec::with_capacity(DEPTH);
     for depth in 0..DEPTH {
         let split = slice.partition_point(|(k, _)| bit(k, depth) == 0);
@@ -89,7 +92,7 @@ pub fn prove(entries: &BTreeMap<Key, Hash>, key: &Key) -> SmtProof {
             (&slice[split..], &slice[..split])
         };
         siblings.push(subtree_root(sibling, depth + 1));
-        slice = chosen.to_vec();
+        slice = chosen;
     }
     SmtProof { siblings }
 }

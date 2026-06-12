@@ -9,7 +9,7 @@
 
 pub mod smt;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use nex_types::{Account, AccountId, AuthPolicy, Block, Hash, Transaction, TransactionKind};
 
@@ -255,7 +255,12 @@ impl State {
                 .iter()
                 .any(|sig| key.verify(message.as_bytes(), sig)),
             AuthPolicy::Threshold { m, keys } => {
-                let signers = keys
+                // Count *distinct* verified keys: a key listed twice in the
+                // policy must not let one signer satisfy the threshold
+                // twice. `m == 0` (or m exceeding the distinct key count)
+                // is malformed and never authorizes anything.
+                let distinct: BTreeSet<_> = keys.iter().collect();
+                let verified = distinct
                     .iter()
                     .filter(|key| {
                         tx.signatures
@@ -263,7 +268,7 @@ impl State {
                             .any(|sig| key.verify(message.as_bytes(), sig))
                     })
                     .count();
-                signers >= *m as usize
+                *m >= 1 && verified >= *m as usize
             }
             // An account can never be claimed *as* unclaimed.
             AuthPolicy::Unclaimed => false,
@@ -504,6 +509,35 @@ mod tests {
             .signed(&keys[0])
             .signed(&keys[2]);
         assert!(state.apply_tx(&two_sigs).result.is_ok());
+    }
+
+    #[test]
+    fn threshold_duplicate_policy_keys_count_as_one_signer() {
+        // Regression: a key listed multiple times in the policy must not let
+        // a single signature satisfy a 2-of-N threshold.
+        let kp = Keypair::from_label("solo-guardian");
+        let policy = AuthPolicy::Threshold {
+            m: 2,
+            keys: vec![kp.public(), kp.public(), kp.public()],
+        };
+        let acct = AccountId::from_auth(&policy, 0);
+        let mut state = State::new();
+        state.genesis_account_with_auth(acct, 100, policy);
+
+        let one_signer = Transaction::transfer(acct, 0, id("bob"), 5).signed(&kp);
+        assert_eq!(state.apply_tx(&one_signer).result, Err(TxError::AuthFailed));
+    }
+
+    #[test]
+    fn zero_of_n_threshold_never_authorizes() {
+        // A malformed 0-of-N policy must not behave like an Open account.
+        let policy = AuthPolicy::Threshold { m: 0, keys: vec![] };
+        let acct = AccountId::from_auth(&policy, 0);
+        let mut state = State::new();
+        state.genesis_account_with_auth(acct, 100, policy);
+
+        let unsigned = Transaction::transfer(acct, 0, id("bob"), 5);
+        assert_eq!(state.apply_tx(&unsigned).result, Err(TxError::AuthFailed));
     }
 
     #[test]

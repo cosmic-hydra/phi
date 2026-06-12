@@ -24,11 +24,30 @@ pub enum AdmissionError {
     Duplicate,
 }
 
+/// Per-sender aggregate over the queued transactions, so admission checks
+/// are O(1) instead of scanning the whole queue per submit.
+#[derive(Clone, Copy, Default)]
+struct SenderProjection {
+    /// Number of queued transactions from this sender.
+    queued: u64,
+    /// Total amount this sender's queued transfers would spend.
+    outflow: u64,
+}
+
+fn outflow_of(tx: &Transaction) -> u64 {
+    match &tx.kind {
+        TransactionKind::Transfer { amount, .. } => *amount,
+        TransactionKind::Mint { .. } => 0,
+    }
+}
+
 /// FIFO mempool with per-sender free-lane quotas.
 pub struct Mempool {
     queue: VecDeque<Transaction>,
     /// Ids of queued transactions for O(1) duplicate rejection.
     pending_ids: HashSet<Hash>,
+    /// Queued-count and outflow per sender, kept in sync with `queue`.
+    per_sender: HashMap<AccountId, SenderProjection>,
     /// Free-lane txs admitted per sender in the current window ("mana").
     window_usage: HashMap<AccountId, u32>,
     /// Max free transactions per sender per window.
@@ -46,8 +65,29 @@ impl Mempool {
         Self {
             queue: VecDeque::new(),
             pending_ids: HashSet::new(),
+            per_sender: HashMap::new(),
             window_usage: HashMap::new(),
             quota_per_window,
+        }
+    }
+
+    fn track(&mut self, tx: &Transaction) {
+        self.pending_ids.insert(tx.id());
+        let projection = self.per_sender.entry(tx.sender).or_default();
+        projection.queued += 1;
+        projection.outflow += outflow_of(tx);
+    }
+
+    fn untrack(&mut self, tx: &Transaction) {
+        self.pending_ids.remove(&tx.id());
+        let projection = self
+            .per_sender
+            .get_mut(&tx.sender)
+            .expect("untracked sender");
+        projection.queued -= 1;
+        projection.outflow -= outflow_of(tx);
+        if projection.queued == 0 {
+            self.per_sender.remove(&tx.sender);
         }
     }
 
@@ -77,10 +117,11 @@ impl Mempool {
         }
 
         // Project the expected nonce forward over already-queued txs so a
-        // sender can queue several sequential transactions.
-        let queued_ahead = self.queue.iter().filter(|q| q.sender == tx.sender).count() as u64;
+        // sender can queue several sequential transactions. The per-sender
+        // aggregate keeps this O(1) regardless of queue size.
+        let projection = self.per_sender.get(&tx.sender).copied().unwrap_or_default();
         if let Some(account) = state.account(&tx.sender) {
-            let expected_nonce = account.nonce + queued_ahead;
+            let expected_nonce = account.nonce + projection.queued;
             if tx.nonce != expected_nonce {
                 return Err(AdmissionError::Invalid(nex_state::TxError::BadNonce {
                     expected: expected_nonce,
@@ -91,16 +132,7 @@ impl Mempool {
             // Project the spendable balance over queued transfers, so a
             // sender cannot queue more outflow than it holds.
             if let TransactionKind::Transfer { amount, .. } = &tx.kind {
-                let pending_outflow: u64 = self
-                    .queue
-                    .iter()
-                    .filter(|q| q.sender == tx.sender)
-                    .map(|q| match &q.kind {
-                        TransactionKind::Transfer { amount, .. } => *amount,
-                        TransactionKind::Mint { .. } => 0,
-                    })
-                    .sum();
-                let spendable = account.balance.saturating_sub(pending_outflow);
+                let spendable = account.balance.saturating_sub(projection.outflow);
                 if *amount > spendable {
                     return Err(AdmissionError::Invalid(
                         nex_state::TxError::InsufficientBalance {
@@ -111,13 +143,13 @@ impl Mempool {
                 }
             }
         }
-        if queued_ahead == 0 {
+        if projection.queued == 0 {
             // Head-of-line: full stateful validation (auth, access, funds).
             state.validate(&tx).map_err(AdmissionError::Invalid)?;
         }
 
         self.window_usage.insert(tx.sender, used + 1);
-        self.pending_ids.insert(tx.id());
+        self.track(&tx);
         self.queue.push_back(tx);
         Ok(())
     }
@@ -127,7 +159,7 @@ impl Mempool {
         let n = max.min(self.queue.len());
         let batch: Vec<Transaction> = self.queue.drain(..n).collect();
         for tx in &batch {
-            self.pending_ids.remove(&tx.id());
+            self.untrack(tx);
         }
         batch
     }
@@ -137,7 +169,7 @@ impl Mempool {
     /// never silently dropped with the rejected proposal.
     pub fn requeue_front(&mut self, batch: Vec<Transaction>) {
         for tx in batch.into_iter().rev() {
-            self.pending_ids.insert(tx.id());
+            self.track(&tx);
             self.queue.push_front(tx);
         }
     }
@@ -294,6 +326,48 @@ mod tests {
         assert_eq!(
             pool.submit(resubmit, &state),
             Err(AdmissionError::Duplicate)
+        );
+    }
+
+    #[test]
+    fn projections_stay_consistent_across_take_and_requeue() {
+        let state = funded_state(); // alice: 1000
+        let mut pool = Mempool::new(16);
+        pool.submit(
+            Transaction::transfer(id("alice"), 0, id("bob"), 300),
+            &state,
+        )
+        .unwrap();
+        pool.submit(
+            Transaction::transfer(id("alice"), 1, id("bob"), 300),
+            &state,
+        )
+        .unwrap();
+
+        let batch = pool.take_batch(2);
+        // Taken txs no longer count toward projections: nonce 0 is expected
+        // again (the caller owns the in-flight batch until commit/requeue).
+        assert_eq!(
+            pool.submit(Transaction::transfer(id("alice"), 1, id("bob"), 1), &state),
+            Err(AdmissionError::Invalid(nex_state::TxError::BadNonce {
+                expected: 0,
+                got: 1
+            }))
+        );
+
+        pool.requeue_front(batch);
+        // Projections restored: expected nonce 2, outflow 600 of 1000.
+        assert!(pool
+            .submit(
+                Transaction::transfer(id("alice"), 2, id("bob"), 400),
+                &state
+            )
+            .is_ok());
+        assert_eq!(
+            pool.submit(Transaction::transfer(id("alice"), 3, id("bob"), 1), &state),
+            Err(AdmissionError::Invalid(
+                nex_state::TxError::InsufficientBalance { have: 0, need: 1 }
+            ))
         );
     }
 }
