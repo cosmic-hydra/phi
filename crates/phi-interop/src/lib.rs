@@ -149,8 +149,10 @@ mod integration_tests {
         };
 
         // Reserve account redeems both, with its own nonce advancing.
-        let tx_a = hub.redeem(&btc_event, &btc_proof, 0).unwrap();
-        let tx_b = hub.redeem(&cosmos_event, &cosmos_proof, 1).unwrap();
+        let tx_a = hub.prepare_redemption(&btc_event, &btc_proof, 0).unwrap();
+        let tx_b = hub
+            .prepare_redemption(&cosmos_event, &cosmos_proof, 1)
+            .unwrap();
         assert_eq!(tx_a.sender, hub.reserve_account());
         assert_eq!(tx_b.sender, hub.reserve_account());
 

@@ -46,8 +46,13 @@ pub struct BridgeHub {
     reserve_keypair: Keypair,
     reserve_account: AccountId,
     clients: BTreeMap<ForeignChainId, Box<dyn LightClient>>,
-    /// Redeemed inbound sequences per foreign chain (replay protection).
-    redeemed: BTreeMap<ForeignChainId, BTreeSet<u64>>,
+    /// Redemptions whose release transfer is built but not yet confirmed
+    /// committed. Keyed by `(chain, sequence)`; holds the exact signed
+    /// transfer so a retry re-issues the *same* transaction (same reserve
+    /// nonce), which the ledger applies at most once.
+    pending: BTreeMap<(ForeignChainId, u64), Transaction>,
+    /// Sequences whose release is confirmed committed (replay protection).
+    settled: BTreeMap<ForeignChainId, BTreeSet<u64>>,
     /// Next outbound sequence per foreign chain.
     outbound_seq: BTreeMap<ForeignChainId, u64>,
 }
@@ -65,7 +70,8 @@ impl BridgeHub {
             reserve_keypair,
             reserve_account,
             clients: BTreeMap::new(),
-            redeemed: BTreeMap::new(),
+            pending: BTreeMap::new(),
+            settled: BTreeMap::new(),
             outbound_seq: BTreeMap::new(),
         }
     }
@@ -86,7 +92,7 @@ impl BridgeHub {
             return Err(InteropError::ChainAlreadyRegistered);
         }
         self.clients.insert(id, Box::new(client));
-        self.redeemed.entry(id).or_default();
+        self.settled.entry(id).or_default();
         self.outbound_seq.entry(id).or_default();
         Ok(())
     }
@@ -113,14 +119,24 @@ impl BridgeHub {
             .tip_height())
     }
 
-    /// Verify a foreign lock event and produce the signed Phi transfer that
-    /// releases the matching amount from the reserve to the beneficiary.
+    /// Phase 1 of redemption: verify a foreign lock event and return the
+    /// signed reserve→beneficiary transfer that releases it. **Does not** mark
+    /// the lock done — call [`BridgeHub::confirm_redemption`] only after that
+    /// transfer is observed committed on Phi.
     ///
-    /// `reserve_nonce` is the reserve account's current nonce (the caller
-    /// applies the returned transaction). Verifying and recording the event
-    /// here makes a second redemption of the same `sequence` fail, so a
-    /// relayer cannot double-spend a single foreign lock.
-    pub fn redeem(
+    /// Safe to call repeatedly for the same lock until confirmed: it returns
+    /// the *identical* transaction (same captured `reserve_nonce`), so even if
+    /// the caller applies it more than once the ledger's nonce replay
+    /// protection settles it at most once. This is what lets a release that
+    /// failed to land (rejected round, transient error) be retried without
+    /// either losing the lock or paying twice. An already-confirmed lock
+    /// returns `AlreadyProcessed`.
+    ///
+    /// `reserve_nonce` is the reserve account's nonce at first prepare; the
+    /// caller must apply prepared releases in nonce order. (Full nonce-
+    /// independent idempotency would record settled `(chain, sequence)` pairs
+    /// in consensus state — see SECURITY.md.)
+    pub fn prepare_redemption(
         &mut self,
         event: &CrossChainEvent,
         proof: &EventProof,
@@ -132,22 +148,58 @@ impl BridgeHub {
             .ok_or(InteropError::UnknownChain)?;
         client.verify_event(event.hash(), proof)?;
 
-        let seen = self.redeemed.entry(event.foreign_chain).or_default();
-        if seen.contains(&event.sequence) {
+        if self
+            .settled
+            .get(&event.foreign_chain)
+            .is_some_and(|s| s.contains(&event.sequence))
+        {
             return Err(InteropError::AlreadyProcessed {
                 sequence: event.sequence,
             });
         }
-        seen.insert(event.sequence);
 
-        Ok(Transaction::transfer(
+        let key = (event.foreign_chain, event.sequence);
+        if let Some(existing) = self.pending.get(&key) {
+            // Idempotent retry: same transaction, same nonce.
+            return Ok(existing.clone());
+        }
+
+        let tx = Transaction::transfer(
             self.reserve_account,
             reserve_nonce,
             event.beneficiary,
             event.amount,
         )
         .with_chain_id(self.phi_chain_id)
-        .signed(&self.reserve_keypair))
+        .signed(&self.reserve_keypair);
+        self.pending.insert(key, tx.clone());
+        Ok(tx)
+    }
+
+    /// Phase 2: mark a prepared redemption settled, after its release transfer
+    /// has committed on Phi. Idempotent; settling an unknown/unprepared
+    /// `(chain, sequence)` is rejected so a caller can't mark a lock done
+    /// without first verifying it via [`BridgeHub::prepare_redemption`].
+    pub fn confirm_redemption(
+        &mut self,
+        foreign_chain: ForeignChainId,
+        sequence: u64,
+    ) -> Result<(), InteropError> {
+        let already = self
+            .settled
+            .get(&foreign_chain)
+            .is_some_and(|s| s.contains(&sequence));
+        if already {
+            return Ok(());
+        }
+        if self.pending.remove(&(foreign_chain, sequence)).is_none() {
+            return Err(InteropError::UnknownChain);
+        }
+        self.settled
+            .entry(foreign_chain)
+            .or_default()
+            .insert(sequence);
+        Ok(())
     }
 
     /// Emit a release instruction for the foreign chain after the caller has
@@ -241,7 +293,7 @@ mod tests {
         hub.submit_foreign_header(chain, &mined, &ConsensusProof::Pow)
             .unwrap();
 
-        let tx = hub.redeem(&event, &proofs[0], 0).unwrap();
+        let tx = hub.prepare_redemption(&event, &proofs[0], 0).unwrap();
         // The release is a signed reserve→beneficiary transfer on Phi.
         assert_eq!(tx.sender, hub.reserve_account());
         assert_eq!(tx.chain_id, 1);
@@ -254,10 +306,38 @@ mod tests {
             _ => panic!("expected transfer"),
         }
 
-        // Replaying the same foreign lock fails.
+        // Retrying before confirmation returns the identical transaction
+        // (same captured nonce) — safe to re-apply, the ledger dedupes it.
+        let retry = hub.prepare_redemption(&event, &proofs[0], 99).unwrap();
+        assert_eq!(retry, tx);
+
+        // Once the release is confirmed committed, the lock can't be redeemed
+        // again.
+        hub.confirm_redemption(event.foreign_chain, event.sequence)
+            .unwrap();
         assert_eq!(
-            hub.redeem(&event, &proofs[0], 1),
+            hub.prepare_redemption(&event, &proofs[0], 1),
             Err(InteropError::AlreadyProcessed { sequence: 0 })
+        );
+        // Confirming again is idempotent.
+        assert!(hub
+            .confirm_redemption(event.foreign_chain, event.sequence)
+            .is_ok());
+    }
+
+    #[test]
+    fn confirming_without_preparing_is_rejected() {
+        let mut hub = BridgeHub::new(1, Keypair::from_label("r"));
+        let chain = ForeignChainId(100);
+        hub.register_chain(
+            chain,
+            PowLightClient::new(&foreign_genesis(), easy_target()),
+        )
+        .unwrap();
+        // No prepare happened, so there is nothing to confirm.
+        assert_eq!(
+            hub.confirm_redemption(chain, 0),
+            Err(InteropError::UnknownChain)
         );
     }
 
@@ -291,7 +371,7 @@ mod tests {
         hub.submit_foreign_header(chain, &header, &ConsensusProof::Bft { votes })
             .unwrap();
 
-        let tx = hub.redeem(&event, &proofs[0], 0).unwrap();
+        let tx = hub.prepare_redemption(&event, &proofs[0], 0).unwrap();
         match tx.kind {
             phi_types::TransactionKind::Transfer { amount, .. } => assert_eq!(amount, 77),
             _ => panic!("expected transfer"),
@@ -330,7 +410,7 @@ mod tests {
             amount: 1_000_000,
         };
         assert_eq!(
-            hub.redeem(&forged, &proofs[0], 0),
+            hub.prepare_redemption(&forged, &proofs[0], 0),
             Err(InteropError::EventNotIncluded)
         );
     }
@@ -351,7 +431,7 @@ mod tests {
             merkle: merkle::MerkleProof { siblings: vec![] },
         };
         assert_eq!(
-            hub.redeem(&event, &proof, 0),
+            hub.prepare_redemption(&event, &proof, 0),
             Err(InteropError::UnknownChain)
         );
         assert_eq!(

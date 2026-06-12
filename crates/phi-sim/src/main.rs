@@ -409,7 +409,10 @@ fn main() {
         merkle: merkle::prove(&leaves, 0).unwrap(),
     };
     let reserve_nonce = engine.canonical_state().account(&reserve).unwrap().nonce;
-    let release_tx = bridge.redeem(&lock, &proof, reserve_nonce).unwrap();
+    // Phase 1: verify the lock and build the release (not yet marked done).
+    let release_tx = bridge
+        .prepare_redemption(&lock, &proof, reserve_nonce)
+        .unwrap();
     mempool
         .submit(release_tx, engine.canonical_state())
         .unwrap();
@@ -419,9 +422,13 @@ fn main() {
         run_round(&mut engine, &mut mempool, batch);
     }
     assert_eq!(engine.canonical_state().balance(&frank), 250);
+    // Phase 2: the release committed, so mark the lock settled.
+    bridge
+        .confirm_redemption(lock.foreign_chain, lock.sequence)
+        .unwrap();
 
-    // The same foreign lock cannot be redeemed twice.
-    match bridge.redeem(&lock, &proof, reserve_nonce + 1) {
+    // The same foreign lock cannot be redeemed again.
+    match bridge.prepare_redemption(&lock, &proof, reserve_nonce + 1) {
         Err(phi_interop::InteropError::AlreadyProcessed { .. }) => {
             println!("  replay of the same foreign lock rejected ✓\n")
         }
