@@ -57,25 +57,29 @@ impl LightClient for BftLightClient {
         self.chain.check_link(header)?;
 
         let message = header.hash();
-        // Count distinct valid signers, so the same validator's signature
-        // cannot be replayed to fake a quorum (mirrors Phi's own QC rule).
-        let mut counted: Vec<u32> = Vec::new();
+        // Count distinct verified *public keys*, not distinct signer indices:
+        // if the foreign validator set lists the same key at two indices, one
+        // key-holder must not be able to satisfy the quorum twice. (Same rule
+        // as Phi's own threshold auth and quorum certificates. `quorum == 0`
+        // is impossible — `new` rejects it — so an empty vote set can never
+        // authorize.)
+        let mut verified_keys: Vec<PublicKey> = Vec::new();
         for vote in votes {
-            if counted.contains(&vote.signer) {
-                continue;
-            }
             let key = self
                 .validators
                 .get(vote.signer as usize)
                 .ok_or(InteropError::BadSignature)?;
+            if verified_keys.contains(key) {
+                continue;
+            }
             if !key.verify(message.as_bytes(), &vote.signature) {
                 return Err(InteropError::BadSignature);
             }
-            counted.push(vote.signer);
+            verified_keys.push(*key);
         }
-        if counted.len() < self.quorum {
+        if verified_keys.len() < self.quorum {
             return Err(InteropError::QuorumNotMet {
-                have: counted.len(),
+                have: verified_keys.len(),
                 need: self.quorum,
             });
         }
@@ -174,6 +178,39 @@ mod tests {
             client.submit_header(&h, &proof),
             Err(InteropError::QuorumNotMet { have: 1, need: 3 })
         );
+    }
+
+    #[test]
+    fn duplicate_key_in_validator_set_cannot_satisfy_quorum_alone() {
+        // Regression for the gemini-code-assist finding: validator 0's key is
+        // (mis)listed at indices 0, 1, and 2. One key-holder signing as all
+        // three indices must NOT reach a quorum of 3 — only one distinct key
+        // verified.
+        let solo = Keypair::from_label("solo");
+        let other = Keypair::from_label("other");
+        let keys = vec![solo.public(), solo.public(), solo.public(), other.public()];
+        let mut client = BftLightClient::new(&genesis(), keys, 3);
+        let h = header_at(&genesis(), Hash::ZERO);
+        let proof = sign_all(&h, &[(0, &solo), (1, &solo), (2, &solo)]);
+        assert_eq!(
+            client.submit_header(&h, &proof),
+            Err(InteropError::QuorumNotMet { have: 1, need: 3 })
+        );
+
+        // Two genuinely distinct keys + the duplicate still only counts two.
+        let proof2 = sign_all(&h, &[(0, &solo), (3, &other)]);
+        assert_eq!(
+            client.submit_header(&h, &proof2),
+            Err(InteropError::QuorumNotMet { have: 2, need: 3 })
+        );
+    }
+
+    #[test]
+    fn zero_quorum_is_rejected_at_construction() {
+        let vs = validators(3);
+        let keys: Vec<PublicKey> = vs.iter().map(|k| k.public()).collect();
+        let result = std::panic::catch_unwind(|| BftLightClient::new(&genesis(), keys, 0));
+        assert!(result.is_err(), "quorum of 0 must not construct");
     }
 
     #[test]
