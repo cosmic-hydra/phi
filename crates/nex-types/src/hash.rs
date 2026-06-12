@@ -14,11 +14,18 @@ impl Hash {
         Hash(*blake3::hash(bytes).as_bytes())
     }
 
-    /// Hash the concatenation of multiple byte slices (domain-separated
-    /// callers should prepend a tag slice).
-    pub fn of_parts(parts: &[&[u8]]) -> Self {
+    /// Domain-separated, length-prefixed hash of structured input.
+    ///
+    /// Every part is prefixed with its u32-LE length, so two different part
+    /// lists can never produce the same byte stream — this is what all
+    /// consensus-critical hashes (transaction ids, headers, Merkle/SMT nodes)
+    /// must use. Plain concatenation is only safe for fixed-width inputs.
+    pub fn of_tagged(tag: &[u8], parts: &[&[u8]]) -> Self {
         let mut hasher = blake3::Hasher::new();
+        hasher.update(&(tag.len() as u32).to_le_bytes());
+        hasher.update(tag);
         for p in parts {
+            hasher.update(&(p.len() as u32).to_le_bytes());
             hasher.update(p);
         }
         Hash(*hasher.finalize().as_bytes())
@@ -46,5 +53,26 @@ impl fmt::Display for Hash {
             write!(f, "{b:02x}")?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tagged_hash_is_not_ambiguous_across_part_boundaries() {
+        // Same concatenated bytes, different part split -> different hash.
+        let a = Hash::of_tagged(b"t", &[b"ab", b"c"]);
+        let b = Hash::of_tagged(b"t", &[b"a", b"bc"]);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn tagged_hash_separates_domains() {
+        assert_ne!(
+            Hash::of_tagged(b"domain-a", &[b"payload"]),
+            Hash::of_tagged(b"domain-b", &[b"payload"])
+        );
     }
 }

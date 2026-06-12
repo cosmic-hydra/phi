@@ -1,13 +1,10 @@
 [package]
-name = "nex-mempool"
+name = "nex-executor"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "NexChain mempool: admission control, free-lane quotas, batch selection"
+description = "NexChain parallel transaction executor: conflict scheduling over declared access sets"
 
 [dependencies]
 nex-types = { workspace = true }
 nex-state = { workspace = true }
-
-[dev-dependencies]
-nex-crypto = { workspace = true }

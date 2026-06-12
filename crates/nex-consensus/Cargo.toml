@@ -3,7 +3,10 @@ name = "nex-consensus"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "NexChain BFT-shaped consensus: signed votes, quorum certificates, view change"
 
 [dependencies]
+nex-crypto = { workspace = true }
 nex-types = { workspace = true }
 nex-state = { workspace = true }
+nex-executor = { workspace = true }

@@ -1,19 +1,23 @@
 //! Core protocol types for NexChain: hashes, accounts, transactions, blocks.
 //!
 //! Design notes (see docs/SPECIFICATION.md):
-//! - Every account is a smart account (native account abstraction). In this
-//!   starter, authentication is modeled by an `AuthPolicy` enum that will grow
-//!   into passkey/session-key/threshold verification in `nex-vm`.
+//! - Every account is a smart account (native account abstraction). Account
+//!   ids commit to the controlling `AuthPolicy`; accounts created by
+//!   receiving funds are `Unclaimed` until the owner reveals the matching
+//!   policy on first spend.
 //! - Transactions declare access sets so the executor can schedule disjoint
-//!   transactions in parallel. The starter executor is serial but conflict
-//!   detection is already exercised in `nex-mempool`.
+//!   transactions in parallel; execution enforces the declaration.
+//! - All consensus-critical hashes are domain-separated and length-prefixed
+//!   (`Hash::of_tagged`).
 
 pub mod account;
 pub mod block;
 pub mod hash;
+pub mod merkle;
 pub mod transaction;
 
 pub use account::{Account, AccountId, AuthPolicy};
 pub use block::{Block, BlockHeader};
 pub use hash::Hash;
-pub use transaction::{AccessSet, Transaction, TransactionKind};
+pub use merkle::MerkleProof;
+pub use transaction::{AccessSet, AuthReveal, Transaction, TransactionKind};

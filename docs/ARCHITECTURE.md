@@ -42,8 +42,12 @@ nexchain/
 └── docs/
 ```
 
-The starter repository in this repo implements a vertical slice:
-`nex-types`, `nex-state`, `nex-consensus` (stub), `nex-mempool`, and `nex-sim`.
+The repository currently implements a vertical slice: `nex-crypto` (Ed25519
+signatures), `nex-types` (tagged hashing, hardened Merkle proofs, auth-bound
+accounts), `nex-state` (SMT-committed state machine with inclusion/exclusion
+proofs), `nex-executor` (conflict-wave parallel scheduler, property-tested
+against serial execution), `nex-mempool`, `nex-consensus` (signed votes,
+quorum certificates, view change, Byzantine simulation), and `nex-sim`.
 
 ## 3. Core Modules and Responsibilities
 

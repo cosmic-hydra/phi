@@ -9,16 +9,22 @@
 
 ## Phase 1 — Core protocol simulation → local cluster
 
-**1a. Single-node simulation (this repo's starter code is the seed):**
-- Core types (blocks, transactions, objects, accounts).
-- In-memory versioned state store with Merkle root.
-- Round-robin/stub consensus producing blocks from a mempool.
-- Serial state-transition function with balance/nonce semantics.
+**1a. Single-node simulation — ✅ implemented in this repo:**
+- Core types (blocks, transactions, accounts) with domain-separated hashing.
+- In-memory state store committed by a Sparse Merkle Tree (inclusion and
+  exclusion proofs).
+- Round-based consensus producing blocks from a mempool, with view change
+  and Byzantine-proposer fault injection.
+- Serial state-transition function with balance/nonce/auth semantics, plus
+  the parallel executor property-tested equivalent to it.
 - Deterministic local simulation: N virtual validators, scripted tx load.
 
-**1b. Multi-node local cluster:**
-- Replace stub with real NexBFT (pacemaker, QCs, view change) over libp2p.
-- Ed25519 validator keys, signature verification, basic slashing evidence.
+**1b. Multi-node local cluster (partially implemented):**
+- ✅ Ed25519 validator keys, signed votes, verifiable quorum certificates,
+  signature verification for account auth policies (single-key, threshold,
+  first-spend claiming).
+- Replace round driver with real NexBFT (pacemaker, pipelining) over libp2p.
+- Slashing evidence from conflicting signed votes.
 - Persistent storage (RocksDB or redb), crash-restart recovery, state sync.
 - Deterministic simulation testing harness (seeded scheduler, fault injection:
   partitions, crashes, Byzantine voters).

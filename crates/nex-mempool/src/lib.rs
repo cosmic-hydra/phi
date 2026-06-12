@@ -2,19 +2,21 @@
 //!
 //! Responsibilities in the full design (docs/ARCHITECTURE.md §3): auth
 //! pre-validation, fee/quota checks (free lane), access-set conflict graph,
-//! and lane routing. The starter implements admission against current state,
-//! a free-lane quota, and conflict-aware batch grouping that the parallel
-//! executor will consume.
+//! and lane routing. The starter implements admission against current state
+//! with per-sender nonce *and balance* projection over queued transactions,
+//! a free-lane quota, duplicate rejection, and re-queuing of batches whose
+//! round failed to commit. Conflict grouping lives in `nex-executor`, which
+//! consumes the batches this mempool produces.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use nex_state::State;
-use nex_types::{AccountId, Transaction};
+use nex_types::{AccountId, Hash, Transaction, TransactionKind};
 
 /// Why a transaction was refused admission.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AdmissionError {
-    /// Stateful validation failed (nonce, balance, unknown sender).
+    /// Stateful validation failed (nonce, balance, auth, unknown sender).
     Invalid(nex_state::TxError),
     /// Free-lane quota exhausted for this sender this block window.
     QuotaExceeded,
@@ -25,6 +27,8 @@ pub enum AdmissionError {
 /// FIFO mempool with per-sender free-lane quotas.
 pub struct Mempool {
     queue: VecDeque<Transaction>,
+    /// Ids of queued transactions for O(1) duplicate rejection.
+    pending_ids: HashSet<Hash>,
     /// Free-lane txs admitted per sender in the current window ("mana").
     window_usage: HashMap<AccountId, u32>,
     /// Max free transactions per sender per window.
@@ -41,6 +45,7 @@ impl Mempool {
     pub fn new(quota_per_window: u32) -> Self {
         Self {
             queue: VecDeque::new(),
+            pending_ids: HashSet::new(),
             window_usage: HashMap::new(),
             quota_per_window,
         }
@@ -54,10 +59,15 @@ impl Mempool {
         self.queue.is_empty()
     }
 
-    /// Admit a transaction if it is valid against `state` (accounting for
-    /// txs already queued from the same sender) and within quota.
+    /// Admit a transaction if it is valid against `state` *projected over
+    /// transactions already queued from the same sender* (nonce sequence and
+    /// remaining spendable balance) and within the free-lane quota.
+    ///
+    /// The head-of-line transaction per sender gets full stateful validation
+    /// including auth; deeper-queued ones are admitted on projection and
+    /// re-checked at execution.
     pub fn submit(&mut self, tx: Transaction, state: &State) -> Result<(), AdmissionError> {
-        if self.queue.iter().any(|q| q.id() == tx.id()) {
+        if self.pending_ids.contains(&tx.id()) {
             return Err(AdmissionError::Duplicate);
         }
 
@@ -68,27 +78,46 @@ impl Mempool {
 
         // Project the expected nonce forward over already-queued txs so a
         // sender can queue several sequential transactions.
-        let queued_ahead = self
-            .queue
-            .iter()
-            .filter(|q| q.sender == tx.sender)
-            .count() as u64;
-        let expected_nonce = state
-            .account(&tx.sender)
-            .map(|a| a.nonce + queued_ahead)
-            .unwrap_or(0);
-        if state.account(&tx.sender).is_some() && tx.nonce != expected_nonce {
-            return Err(AdmissionError::Invalid(nex_state::TxError::BadNonce {
-                expected: expected_nonce,
-                got: tx.nonce,
-            }));
+        let queued_ahead = self.queue.iter().filter(|q| q.sender == tx.sender).count() as u64;
+        if let Some(account) = state.account(&tx.sender) {
+            let expected_nonce = account.nonce + queued_ahead;
+            if tx.nonce != expected_nonce {
+                return Err(AdmissionError::Invalid(nex_state::TxError::BadNonce {
+                    expected: expected_nonce,
+                    got: tx.nonce,
+                }));
+            }
+
+            // Project the spendable balance over queued transfers, so a
+            // sender cannot queue more outflow than it holds.
+            if let TransactionKind::Transfer { amount, .. } = &tx.kind {
+                let pending_outflow: u64 = self
+                    .queue
+                    .iter()
+                    .filter(|q| q.sender == tx.sender)
+                    .map(|q| match &q.kind {
+                        TransactionKind::Transfer { amount, .. } => *amount,
+                        TransactionKind::Mint { .. } => 0,
+                    })
+                    .sum();
+                let spendable = account.balance.saturating_sub(pending_outflow);
+                if *amount > spendable {
+                    return Err(AdmissionError::Invalid(
+                        nex_state::TxError::InsufficientBalance {
+                            have: spendable,
+                            need: *amount,
+                        },
+                    ));
+                }
+            }
         }
         if queued_ahead == 0 {
-            // Only the head-of-line tx can be fully validated statefully.
+            // Head-of-line: full stateful validation (auth, access, funds).
             state.validate(&tx).map_err(AdmissionError::Invalid)?;
         }
 
         self.window_usage.insert(tx.sender, used + 1);
+        self.pending_ids.insert(tx.id());
         self.queue.push_back(tx);
         Ok(())
     }
@@ -96,29 +125,26 @@ impl Mempool {
     /// Take up to `max` transactions for the next block proposal.
     pub fn take_batch(&mut self, max: usize) -> Vec<Transaction> {
         let n = max.min(self.queue.len());
-        self.queue.drain(..n).collect()
+        let batch: Vec<Transaction> = self.queue.drain(..n).collect();
+        for tx in &batch {
+            self.pending_ids.remove(&tx.id());
+        }
+        batch
+    }
+
+    /// Return a batch to the front of the queue in its original order —
+    /// called when a consensus round fails to commit, so transactions are
+    /// never silently dropped with the rejected proposal.
+    pub fn requeue_front(&mut self, batch: Vec<Transaction>) {
+        for tx in batch.into_iter().rev() {
+            self.pending_ids.insert(tx.id());
+            self.queue.push_front(tx);
+        }
     }
 
     /// Reset free-lane quotas (called per block window).
     pub fn reset_window(&mut self) {
         self.window_usage.clear();
-    }
-
-    /// Group a batch into sub-batches whose access sets are mutually
-    /// disjoint — each group can run in parallel; groups run in order.
-    /// This is the seed of the Block-STM scheduler (Phase 2).
-    pub fn parallel_groups(batch: &[Transaction]) -> Vec<Vec<Transaction>> {
-        let mut groups: Vec<Vec<Transaction>> = Vec::new();
-        'next_tx: for tx in batch {
-            for group in groups.iter_mut() {
-                if group.iter().all(|g| g.access.disjoint_from(&tx.access)) {
-                    group.push(tx.clone());
-                    continue 'next_tx;
-                }
-            }
-            groups.push(vec![tx.clone()]);
-        }
-        groups
     }
 }
 
@@ -161,8 +187,11 @@ mod tests {
         let state = funded_state();
         let mut pool = Mempool::new(2);
         for nonce in 0..2 {
-            pool.submit(Transaction::transfer(id("alice"), nonce, id("bob"), 1), &state)
-                .unwrap();
+            pool.submit(
+                Transaction::transfer(id("alice"), nonce, id("bob"), 1),
+                &state,
+            )
+            .unwrap();
         }
         assert_eq!(
             pool.submit(Transaction::transfer(id("alice"), 2, id("bob"), 1), &state),
@@ -184,15 +213,87 @@ mod tests {
     }
 
     #[test]
-    fn parallel_groups_separate_conflicts() {
-        let txs = vec![
-            Transaction::transfer(id("alice"), 0, id("bob"), 1), // writes alice,bob
-            Transaction::transfer(id("carol"), 0, id("dave"), 1), // disjoint -> same group
-            Transaction::transfer(id("alice"), 1, id("eve"), 1), // conflicts with #1 -> new group
-        ];
-        let groups = Mempool::parallel_groups(&txs);
-        assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].len(), 2);
-        assert_eq!(groups[1].len(), 1);
+    fn queued_outflow_cannot_exceed_balance() {
+        let state = funded_state(); // alice: 1000
+        let mut pool = Mempool::new(16);
+        pool.submit(
+            Transaction::transfer(id("alice"), 0, id("bob"), 600),
+            &state,
+        )
+        .unwrap();
+        // Head-of-line alone would pass (600 < 1000); the projection over
+        // the queue must reject the cumulative 1200.
+        assert_eq!(
+            pool.submit(
+                Transaction::transfer(id("alice"), 1, id("bob"), 600),
+                &state
+            ),
+            Err(AdmissionError::Invalid(
+                nex_state::TxError::InsufficientBalance {
+                    have: 400,
+                    need: 600
+                }
+            ))
+        );
+        assert!(pool
+            .submit(
+                Transaction::transfer(id("alice"), 1, id("bob"), 400),
+                &state
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn unsigned_spend_from_keyed_account_rejected_at_admission() {
+        use nex_crypto::Keypair;
+        use nex_types::AuthPolicy;
+
+        let kp = Keypair::from_label("alice-key");
+        let policy = AuthPolicy::SingleKey(kp.public());
+        let alice = AccountId::from_auth(&policy, 0);
+        let mut state = State::new();
+        state.genesis_account_with_auth(alice, 1000, policy);
+
+        let mut pool = Mempool::new(16);
+        assert_eq!(
+            pool.submit(Transaction::transfer(alice, 0, id("bob"), 1), &state),
+            Err(AdmissionError::Invalid(nex_state::TxError::AuthFailed))
+        );
+        assert!(pool
+            .submit(
+                Transaction::transfer(alice, 0, id("bob"), 1).signed(&kp),
+                &state
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn requeue_preserves_order_and_duplicate_protection() {
+        let state = funded_state();
+        let mut pool = Mempool::new(16);
+        for nonce in 0..3 {
+            pool.submit(
+                Transaction::transfer(id("alice"), nonce, id("bob"), 1),
+                &state,
+            )
+            .unwrap();
+        }
+        let batch = pool.take_batch(2);
+        assert_eq!(pool.len(), 1);
+
+        let resubmit = batch[0].clone();
+        pool.requeue_front(batch);
+        assert_eq!(pool.len(), 3);
+        // Order restored: nonces 0,1,2 from the front.
+        let drained = pool.take_batch(3);
+        assert_eq!(
+            drained.iter().map(|t| t.nonce).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        pool.requeue_front(drained);
+        assert_eq!(
+            pool.submit(resubmit, &state),
+            Err(AdmissionError::Duplicate)
+        );
     }
 }
