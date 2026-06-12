@@ -1,0 +1,11 @@
+[package]
+name = "phi-interop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Phi interoperability: pluggable light-client verifiers and a trust-minimized lock/mint bridge"
+
+[dependencies]
+blake3 = { workspace = true }
+phi-crypto = { workspace = true }
+phi-types = { workspace = true }

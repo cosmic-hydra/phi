@@ -29,6 +29,8 @@ crates/
 │                   # projection, free-lane quotas, requeue on failed rounds
 ├── phi-consensus/  # BFT-shaped consensus: signed votes, verifiable quorum
 │                   # certificates, view change, Byzantine validator simulation
+├── phi-interop/    # trust-minimized cross-chain bridge: pluggable light-client
+│                   # verifiers (PoW + BFT adapters), no multisig bridges
 └── phi-sim/        # local simulation binary demonstrating the full pipeline
 ```
 
@@ -72,11 +74,26 @@ The simulation demonstrates:
    admission edge, and an issuance audit refuses quorum to any block that
    mints without authority or breaks supply conservation — even when the
    bare state machine would accept it.
-8. A light-client audit: quorum-certificate verification for the whole chain,
+8. **Trust-minimized interop**: a foreign proof-of-work chain's header is
+   verified by a light client (no trusted relayer or multisig), and a
+   committed lock event releases figs from the bridge reserve through
+   consensus — replay of the same foreign lock rejected.
+9. A light-client audit: quorum-certificate verification for the whole chain,
    a Merkle transaction inclusion proof, and SMT inclusion/exclusion proofs
    for accounts.
-9. Byte-identical state roots across validators, audited supply, and a
-   serial replay that matches the parallel executor exactly.
+10. Byte-identical state roots across validators, audited supply, and a
+    serial replay that matches the parallel executor exactly.
+
+## Interoperability
+
+Phi connects to other chains the way the spec demands (§11): **no multisig
+bridges**. `phi-interop` runs a light client of each foreign chain and verifies
+that chain's own consensus, so cross-chain transfers are accepted only against
+proofs a relayer cannot forge. Two reference adapters cover the dominant
+families — `PowLightClient` (Bitcoin-style SPV) and `BftLightClient`
+(Tendermint/Cosmos/Solana-style validator sets). Supporting a specific chain
+means implementing the `LightClient` trait for its rules; there is no automatic
+"works with every blockchain" switch, because each chain's finality differs.
 
 ## Security
 

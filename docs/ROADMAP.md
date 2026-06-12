@@ -56,7 +56,9 @@ registry) running on a public testnet; audited consensus + VM core.
   established chain for bootstrap security.
 - Shielded balances (note commitments + Poseidon2 circuits), viewing keys.
 - Threshold-encrypted mempool; randomness beacon via threshold BLS.
-- ZK light clients for interop (Ethereum first).
+- Interop: upgrade the `phi-interop` light clients (PoW + BFT adapters already
+  implemented) to ZK-SNARK-aggregated verification; add validator-set rotation
+  / weak-subjectivity handling and Ethereum sync-committee support.
 - Governance modules (bicameral), storage deposits, mainnet genesis.
 
 ## Key Milestones

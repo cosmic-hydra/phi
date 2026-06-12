@@ -23,6 +23,7 @@ trusted.
 | **Light-client deception** | Sparse-Merkle-Tree state commitment with inclusion *and* exclusion proofs; Merkle transaction-inclusion proofs; QC chain verification. | `phi-state::smt`, `phi-types::merkle` |
 | **Nonce griefing** | Invalid transactions (bad auth/nonce/access/chain/oversize) consume nothing; only genuinely authorized runtime failures consume the nonce. | `phi-state` |
 | **Empty/degenerate validator set** | Constructing a consensus engine with zero validators panics rather than producing a chain with no quorum. | `phi-consensus` |
+| **Cross-chain bridge forgery / double-redeem** | No multisig bridge: foreign events are verified against the foreign chain's own consensus via a light client (PoW SPV or BFT quorum), plus a Merkle inclusion proof. Redeemed foreign sequences are recorded, so a lock cannot be redeemed twice. The bridge releases from a reserve (never mints), conserving supply. | `phi-interop` |
 
 ## What is explicitly NOT yet covered
 
@@ -39,7 +40,11 @@ are designed-for but **not implemented**, and must not be relied on:
 - **Key management** (HSM/keystore, rotation, forward security). Simulation
   keys are label-derived and deterministic — never use them anywhere real.
 - **Long-range / weak-subjectivity attacks**, checkpoint anchoring, and the
-  ZK/privacy/interop layers (all Phase 3 in the spec).
+  ZK/privacy layers (Phase 3 in the spec).
+- **Interop hardening beyond light-client basics**: the `phi-interop` adapters
+  do SPV/quorum header verification, but ZK-SNARK aggregation, validator-set
+  rotation, PoW retargeting / most-work fork choice, and the foreign-side
+  release contracts are not implemented. Do not bridge real value on it.
 - **VM-level exploits** — there is no smart-contract VM yet; only fixed
   transfer/mint transaction kinds.
 - **Side channels, supply-chain, and dependency vulnerabilities.**
