@@ -1,9 +1,0 @@
-[package]
-name = "nex-mempool"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[dependencies]
-nex-types = { workspace = true }
-nex-state = { workspace = true }

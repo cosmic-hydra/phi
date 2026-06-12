@@ -1,0 +1,10 @@
+[package]
+name = "phi-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Phi cryptographic primitives: Ed25519 keys and signatures"
+
+[dependencies]
+blake3 = { workspace = true }
+ed25519-dalek = { workspace = true }

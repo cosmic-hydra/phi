@@ -1,24 +1,32 @@
-# NexChain Implementation Roadmap
+# Phi Implementation Roadmap
 
 > Companion to [SPECIFICATION.md](./SPECIFICATION.md) and [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 ## Phase 0 — Design hardening (now)
 
-- Specification review, threat-model workshops, TLA+ model of NexBFT safety.
+- Specification review, threat-model workshops, TLA+ model of PhiBFT safety.
 - **Exit criteria:** spec v1.0 frozen for testnet scope; consensus model checked.
 
 ## Phase 1 — Core protocol simulation → local cluster
 
-**1a. Single-node simulation (this repo's starter code is the seed):**
-- Core types (blocks, transactions, objects, accounts).
-- In-memory versioned state store with Merkle root.
-- Round-robin/stub consensus producing blocks from a mempool.
-- Serial state-transition function with balance/nonce semantics.
+**1a. Single-node simulation — ✅ implemented in this repo:**
+- Core types (blocks, transactions, accounts) with domain-separated hashing.
+- In-memory state store committed by a Sparse Merkle Tree (inclusion and
+  exclusion proofs).
+- Round-based consensus producing blocks from a mempool, with view change
+  and Byzantine-proposer fault injection.
+- Serial state-transition function with balance/nonce/auth semantics, plus
+  the parallel executor property-tested equivalent to it.
+- The Cargo guard sub-protocol: fig issuance governance and supply audits
+  enforced at voting, per-peer brute-force throttling at the edge.
 - Deterministic local simulation: N virtual validators, scripted tx load.
 
-**1b. Multi-node local cluster:**
-- Replace stub with real NexBFT (pacemaker, QCs, view change) over libp2p.
-- Ed25519 validator keys, signature verification, basic slashing evidence.
+**1b. Multi-node local cluster (partially implemented):**
+- ✅ Ed25519 validator keys, signed votes, verifiable quorum certificates,
+  signature verification for account auth policies (single-key, threshold,
+  first-spend claiming).
+- Replace round driver with real PhiBFT (pacemaker, pipelining) over libp2p.
+- Slashing evidence from conflicting signed votes.
 - Persistent storage (RocksDB or redb), crash-restart recovery, state sync.
 - Deterministic simulation testing harness (seeded scheduler, fault injection:
   partitions, crashes, Byzantine voters).
@@ -28,7 +36,7 @@ faults injected, zero safety violations across 10^6 randomized sim runs.
 
 ## Phase 2 — Minimal viable implementation of key components
 
-1. **NexVM:** wasmtime embedding, determinism enforcement, gas metering,
+1. **PhiVM:** wasmtime embedding, determinism enforcement, gas metering,
    object host API, bytecode verifier for resource rules.
 2. **Parallel executor:** declared access sets, Block-STM optimistic engine,
    serial-equivalence property tests.
@@ -57,7 +65,7 @@ registry) running on a public testnet; audited consensus + VM core.
 |---|---|
 | M1 | Local sim: blocks + txs + deterministic state root (starter code) |
 | M2 | 4-node BFT cluster with finality and recovery |
-| M3 | NexVM executes user WASM contracts with gas |
+| M3 | PhiVM executes user WASM contracts with gas |
 | M4 | Parallel executor beats serial baseline ≥5x on disjoint workloads |
 | M5 | Passkey wallet end-to-end on devnet |
 | M6 | Public testnet with fast path + consensus path |

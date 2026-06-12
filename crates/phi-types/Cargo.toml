@@ -1,0 +1,10 @@
+[package]
+name = "phi-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Phi core types: hashes, accounts, transactions, blocks"
+
+[dependencies]
+blake3 = { workspace = true }
+phi-crypto = { workspace = true }
