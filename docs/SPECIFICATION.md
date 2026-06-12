@@ -1,4 +1,4 @@
-# NexChain Protocol Specification (v0.1 Draft)
+# Phi Protocol Specification (v0.1 Draft)
 
 > **Status:** Design draft. Everything here is intended to be iterated on.
 > **Companion docs:** [ARCHITECTURE.md](./ARCHITECTURE.md), [ROADMAP.md](./ROADMAP.md)
@@ -7,17 +7,17 @@
 
 ## 1. Name, Vision, and How It Improves on Web3
 
-**Name:** NexChain (working title)
+**Name:** Phi (working title)
 
 **Vision:** A modular, agent-centric blockchain that feels like a modern web
 app to users, scales horizontally like a distributed database, and remains
-verifiable end-to-end with zero-knowledge proofs. NexChain treats *global
+verifiable end-to-end with zero-knowledge proofs. Phi treats *global
 consensus as a scarce resource*: most activity happens in parallel, locally
 validated execution lanes, and only succinct commitments are globally ordered.
 
 **How it improves on today's Web3:**
 
-| Pain point today | NexChain answer |
+| Pain point today | Phi answer |
 |---|---|
 | High fees, low throughput | Parallel object-based execution + ZK-compressed settlement; fee-free lane for rate-limited transactions |
 | Seed phrases, gas UX | Native account abstraction, passkey (WebAuthn) signers, session keys, fee sponsorship at protocol level |
@@ -45,7 +45,7 @@ flowchart TB
         L1[Lane A<br/>object-scoped execution]
         L2[Lane B]
         L3[Lane N...]
-        VM[NexVM - WASM deterministic VM<br/>resource-oriented state]
+        VM[PhiVM - WASM deterministic VM<br/>resource-oriented state]
     end
 
     subgraph Cons["Consensus Layer"]
@@ -84,7 +84,7 @@ available without every node storing everything.
 ## 3. Consensus Mechanism
 
 **Choice:** Pipelined HotStuff-style BFT Proof-of-Stake with VRF committee
-sortition ("NexBFT").
+sortition ("PhiBFT").
 
 - **Why BFT-PoS:** deterministic finality (sub-2-second), energy efficient,
   well-studied (Tendermint, HotStuff, Jolteon lineage), simple light clients.
@@ -110,7 +110,7 @@ sortition ("NexBFT").
 
 ## 4. Execution Environment / Virtual Machine
 
-**NexVM** — a deterministic WASM-based VM with **resource-oriented semantics**
+**PhiVM** — a deterministic WASM-based VM with **resource-oriented semantics**
 (inspired by Move) and **object-scoped parallelism** (inspired by Sui/Solana's
 access lists, generalized).
 
@@ -120,7 +120,7 @@ access lists, generalized).
   metering at the instruction level.
 - **Resource types:** Assets are linear types — they cannot be copied or
   implicitly dropped, eliminating entire classes of bugs (re-entrancy double
-  spends, accidental burns). Enforced by the NexVM ABI and the standard
+  spends, accidental burns). Enforced by the PhiVM ABI and the standard
   library, verified at module-publish time by a bytecode verifier.
 - **Object model:** All state lives in *objects* with explicit ownership:
   - `Owned(account)` — single-writer; processed without global ordering
@@ -197,7 +197,7 @@ externally-owned accounts.
    certificate of execution is gossiped; consensus only checkpoints the lane
    root. Latency: ~sub-second.
 4. **Consensus path (shared objects):** transaction commitment is ordered by
-   NexBFT; deterministic parallel execution follows ordering.
+   PhiBFT; deterministic parallel execution follows ordering.
 5. **Finalize** — state root updated; receipt with inclusion proof returned;
    data blob persisted to DA; periodically a ZK validity proof aggregates many
    blocks for light clients and interop.
@@ -222,7 +222,8 @@ the protocol level. Trade-off: ~1 round of extra latency on the consensus path.
 
 ## 8. Tokenomics and Incentive Design
 
-**Token:** `NEX`.
+**Token:** `FIG` — Phi's native asset; individual units are *figs*. Issuance
+and supply integrity are governed by the Cargo guard sub-protocol (§12).
 
 - **Issuance:** disinflationary tail emission (e.g., starts ~5%/yr, decays to
   ~1%/yr floor) paying validators and the DA/storage market. Tail emission is
@@ -237,7 +238,7 @@ the protocol level. Trade-off: ~1 round of extra latency on the consensus path.
     more independent failure domains, which is the actual goal.)
   - Delegators share slashing risk → they police validators.
 - **Storage is paid, not free:** state rent via *storage deposits* — locked
-  NEX refunded when objects are deleted. Prevents unbounded state growth.
+  FIG refunded when objects are deleted. Prevents unbounded state growth.
 - **Contributor/builder rewards:** a fixed slice of emission funds public
   goods via governance-directed retroactive funding rounds.
 - **Bootstrapping security (Issue 5):** see Section 12, point 5.
@@ -287,11 +288,11 @@ the protocol level. Trade-off: ~1 round of extra latency on the consensus path.
 
 - **No multisig bridges, ever.** All cross-chain trust is cryptographic:
   - **Inbound:** ZK light clients verify external consensus (e.g., Ethereum
-    sync-committee proofs, Tendermint-style headers) inside NexVM circuits.
-  - **Outbound:** NexChain's aggregated validity proofs + BFT light-client
+    sync-committee proofs, Tendermint-style headers) inside PhiVM circuits.
+  - **Outbound:** Phi's aggregated validity proofs + BFT light-client
     proofs are cheap to verify on other chains (constant-size SNARKs).
 - **Native message-passing standard** (IBC-inspired): ordered, authenticated
-  channels between NexChain objects and external chain contracts; assets move
+  channels between Phi objects and external chain contracts; assets move
   by lock/mint with proofs, or burn/release.
 - **Internal interop is trivial:** lanes share one security domain and one DA
   layer, so "cross-shard" calls are just ordered messages — no bridges between
@@ -322,9 +323,37 @@ partially synchronous network.
 without circuit equivalents; all protocol upgrades themselves go through the
 VM and governance.
 
+### Cargo: the guard sub-protocol
+
+**Cargo** is Phi's layered guard sub-protocol. It governs **figs** — the
+native asset — and hardens the protocol's outer surfaces with deterministic,
+independently enforceable defenses (implemented in `phi-cargo`):
+
+- **Issuance governance.** Only the governance-designated minter account may
+  create figs, within a per-block cap. Edge nodes screen submissions before
+  they occupy mempool space; every validator re-runs the same rules when
+  voting, so unauthorized issuance cannot reach quorum even if a colluding
+  proposer includes it.
+- **Supply-invariant tripwire.** The voting-time audit recomputes the
+  expected supply (pre-state supply + authorized issuance) and refuses any
+  block whose post-state conjures or destroys figs. This catches *classes*
+  of execution exploits — not just enumerated ones — because it checks the
+  economic invariant rather than the mechanism.
+- **Brute-force throttling.** Repeated authentication failures from a peer
+  trigger exponentially growing cooldowns at the admission edge, cutting off
+  forged-signature probing and credential-guessing spam before it costs
+  verification work. Throttling keys on the *submitting peer*, never on the
+  claimed sender, so an attacker spraying forged transactions can never lock
+  a victim out of their own account.
+
+Scope, stated honestly: brute-forcing Ed25519 keys is computationally
+infeasible with or without Cargo. What Cargo removes is the cheap spam/probe
+surface, and what its audits add are invariant tripwires enforced before
+quorum — defense in depth around the cryptography, not a replacement for it.
+
 ---
 
-## 13. How NexChain Patches Each of the 10 Issues
+## 13. How Phi Patches Each of the 10 Issues
 
 1. **Scalability & Cost** — Owned-object fast path needs no global consensus;
    shared-object txs execute in parallel via declared access sets across
@@ -332,7 +361,7 @@ VM and governance.
    ZK aggregation compresses verification. Realistic target: ~10k TPS on the
    consensus path per committee + ~100k+ TPS aggregate across lanes/fast path
    under benign workloads. (Stated honestly: 100k+ sustained *global shared
-   state* TPS is not credible on any design; NexChain achieves it by making
+   state* TPS is not credible on any design; Phi achieves it by making
    most traffic *not need* global ordering.) Fees: free lane + burned base
    fees keep standard txs near zero.
 2. **User Experience** — Passkeys, no seed phrases, session keys, protocol

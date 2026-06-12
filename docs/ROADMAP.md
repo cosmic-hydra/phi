@@ -1,10 +1,10 @@
-# NexChain Implementation Roadmap
+# Phi Implementation Roadmap
 
 > Companion to [SPECIFICATION.md](./SPECIFICATION.md) and [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 ## Phase 0 — Design hardening (now)
 
-- Specification review, threat-model workshops, TLA+ model of NexBFT safety.
+- Specification review, threat-model workshops, TLA+ model of PhiBFT safety.
 - **Exit criteria:** spec v1.0 frozen for testnet scope; consensus model checked.
 
 ## Phase 1 — Core protocol simulation → local cluster
@@ -17,13 +17,15 @@
   and Byzantine-proposer fault injection.
 - Serial state-transition function with balance/nonce/auth semantics, plus
   the parallel executor property-tested equivalent to it.
+- The Cargo guard sub-protocol: fig issuance governance and supply audits
+  enforced at voting, per-peer brute-force throttling at the edge.
 - Deterministic local simulation: N virtual validators, scripted tx load.
 
 **1b. Multi-node local cluster (partially implemented):**
 - ✅ Ed25519 validator keys, signed votes, verifiable quorum certificates,
   signature verification for account auth policies (single-key, threshold,
   first-spend claiming).
-- Replace round driver with real NexBFT (pacemaker, pipelining) over libp2p.
+- Replace round driver with real PhiBFT (pacemaker, pipelining) over libp2p.
 - Slashing evidence from conflicting signed votes.
 - Persistent storage (RocksDB or redb), crash-restart recovery, state sync.
 - Deterministic simulation testing harness (seeded scheduler, fault injection:
@@ -34,7 +36,7 @@ faults injected, zero safety violations across 10^6 randomized sim runs.
 
 ## Phase 2 — Minimal viable implementation of key components
 
-1. **NexVM:** wasmtime embedding, determinism enforcement, gas metering,
+1. **PhiVM:** wasmtime embedding, determinism enforcement, gas metering,
    object host API, bytecode verifier for resource rules.
 2. **Parallel executor:** declared access sets, Block-STM optimistic engine,
    serial-equivalence property tests.
@@ -63,7 +65,7 @@ registry) running on a public testnet; audited consensus + VM core.
 |---|---|
 | M1 | Local sim: blocks + txs + deterministic state root (starter code) |
 | M2 | 4-node BFT cluster with finality and recovery |
-| M3 | NexVM executes user WASM contracts with gas |
+| M3 | PhiVM executes user WASM contracts with gas |
 | M4 | Parallel executor beats serial baseline ≥5x on disjoint workloads |
 | M5 | Passkey wallet end-to-end on devnet |
 | M6 | Public testnet with fast path + consensus path |

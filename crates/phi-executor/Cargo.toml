@@ -1,0 +1,10 @@
+[package]
+name = "phi-executor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Phi parallel transaction executor: conflict scheduling over declared access sets"
+
+[dependencies]
+phi-types = { workspace = true }
+phi-state = { workspace = true }

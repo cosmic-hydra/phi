@@ -1,0 +1,12 @@
+[package]
+name = "phi-state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Phi state machine: SMT-committed account store and deterministic state transition"
+
+[dependencies]
+phi-types = { workspace = true }
+
+[dev-dependencies]
+phi-crypto = { workspace = true }

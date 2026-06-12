@@ -25,4 +25,4 @@ jobs:
       - name: Tests
         run: cargo test --workspace
       - name: Simulation
-        run: cargo run -p nex-sim
+        run: cargo run -p phi-sim

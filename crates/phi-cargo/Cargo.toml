@@ -1,0 +1,10 @@
+[package]
+name = "phi-cargo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cargo: Phi's guard sub-protocol — fig issuance governance, supply audits, admission throttling"
+
+[dependencies]
+phi-types = { workspace = true }
+phi-state = { workspace = true }

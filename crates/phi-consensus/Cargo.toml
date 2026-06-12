@@ -1,0 +1,13 @@
+[package]
+name = "phi-consensus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Phi BFT-shaped consensus: signed votes, quorum certificates, view change"
+
+[dependencies]
+phi-crypto = { workspace = true }
+phi-types = { workspace = true }
+phi-state = { workspace = true }
+phi-executor = { workspace = true }
+phi-cargo = { workspace = true }

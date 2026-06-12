@@ -210,17 +210,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
-name = "nex-consensus"
+name = "phi-cargo"
 version = "0.1.0"
 dependencies = [
- "nex-crypto",
- "nex-executor",
- "nex-state",
- "nex-types",
+ "phi-state",
+ "phi-types",
 ]
 
 [[package]]
-name = "nex-crypto"
+name = "phi-consensus"
+version = "0.1.0"
+dependencies = [
+ "phi-cargo",
+ "phi-crypto",
+ "phi-executor",
+ "phi-state",
+ "phi-types",
+]
+
+[[package]]
+name = "phi-crypto"
 version = "0.1.0"
 dependencies = [
  "blake3",
@@ -228,48 +237,49 @@ dependencies = [
 ]
 
 [[package]]
-name = "nex-executor"
+name = "phi-executor"
 version = "0.1.0"
 dependencies = [
- "nex-state",
- "nex-types",
+ "phi-state",
+ "phi-types",
 ]
 
 [[package]]
-name = "nex-mempool"
+name = "phi-mempool"
 version = "0.1.0"
 dependencies = [
- "nex-crypto",
- "nex-state",
- "nex-types",
+ "phi-crypto",
+ "phi-state",
+ "phi-types",
 ]
 
 [[package]]
-name = "nex-sim"
+name = "phi-sim"
 version = "0.1.0"
 dependencies = [
- "nex-consensus",
- "nex-crypto",
- "nex-executor",
- "nex-mempool",
- "nex-state",
- "nex-types",
+ "phi-cargo",
+ "phi-consensus",
+ "phi-crypto",
+ "phi-executor",
+ "phi-mempool",
+ "phi-state",
+ "phi-types",
 ]
 
 [[package]]
-name = "nex-state"
+name = "phi-state"
 version = "0.1.0"
 dependencies = [
- "nex-crypto",
- "nex-types",
+ "phi-crypto",
+ "phi-types",
 ]
 
 [[package]]
-name = "nex-types"
+name = "phi-types"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "nex-crypto",
+ "phi-crypto",
 ]
 
 [[package]]
