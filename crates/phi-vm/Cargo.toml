@@ -1,0 +1,9 @@
+[package]
+name = "phi-vm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PhiVM: a deterministic, gas-metered bytecode VM for Phi smart contracts"
+
+[dependencies]
+phi-types = { workspace = true }

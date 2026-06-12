@@ -13,6 +13,8 @@ phi-executor = { workspace = true }
 phi-cargo = { workspace = true }
 phi-mempool = { workspace = true }
 phi-consensus = { workspace = true }
+phi-interop = { workspace = true }
+phi-vm = { workspace = true }
 
 [[bin]]
 name = "phi-sim"

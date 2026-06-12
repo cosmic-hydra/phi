@@ -18,19 +18,30 @@
 //!    admission edge, and fig issuance governance — an unauthorized mint the
 //!    bare state machine accepts is refused quorum by the validator audit,
 //!    while governance-approved issuance commits.
-//! 8. A light-client audit: QC chain verification, a Merkle transaction
-//!    inclusion proof, and SMT inclusion/exclusion proofs for accounts.
-//! 9. Serial replay equality: the parallel executor's chain state matches
-//!    byte-for-byte a serial re-execution of every committed block.
+//! 8. Trust-minimized interop: a foreign proof-of-work chain's header is
+//!    verified by a light client (no trusted relayer), and a committed lock
+//!    event releases figs from the bridge reserve via consensus — replay of
+//!    the same foreign lock rejected.
+//! 9. Smart contracts: a deterministic, gas-metered PhiVM token contract runs
+//!    a transfer and an atomically-reverted overspend (standalone; ledger
+//!    integration is the next step).
+//! 10. A light-client audit: QC chain verification, a Merkle transaction
+//!     inclusion proof, and SMT inclusion/exclusion proofs for accounts.
+//! 11. Serial replay equality: the parallel executor's chain state matches
+//!     byte-for-byte a serial re-execution of every committed block.
 
 use std::collections::HashMap;
 
 use phi_cargo::{FigGovernor, GuardError, PeerId, Throttle, ThrottleConfig};
 use phi_consensus::{ConsensusEngine, RoundOutcome};
 use phi_crypto::Keypair;
+use phi_interop::{
+    BridgeHub, ConsensusProof, CrossChainEvent, EventProof, ForeignChainId, ForeignHeader,
+    PowLightClient,
+};
 use phi_mempool::{AdmissionError, Mempool};
 use phi_state::{State, TxError};
-use phi_types::{AccountId, AuthPolicy, Block, Hash, Transaction};
+use phi_types::{merkle, AccountId, AuthPolicy, Block, Hash, Transaction};
 
 fn main() {
     println!("=== Phi local simulation ===\n");
@@ -60,12 +71,21 @@ fn main() {
     let dave = AccountId::from_auth(&dave_policy, DAVE_SALT);
     let eve = AccountId::from_auth(&eve_policy, 0);
 
+    // The cross-chain bridge reserve: a pre-funded account backing wrapped
+    // balances, controlled by the bridge key (see the interop section). And
+    // `frank`, a beneficiary who receives figs bridged in from a foreign chain.
+    let reserve_kp = Keypair::from_label("phi-bridge-reserve");
+    let reserve = AccountId::from_auth(&AuthPolicy::SingleKey(reserve_kp.public()), 0);
+    let frank = AccountId::from_label("frank");
+
     let names: HashMap<AccountId, &str> = [
         (alice, "alice"),
         (bob, "bob"),
         (carol, "carol"),
         (dave, "dave"),
         (eve, "eve"),
+        (reserve, "reserve"),
+        (frank, "frank"),
     ]
     .into_iter()
     .collect();
@@ -93,11 +113,13 @@ fn main() {
     genesis.genesis_account_with_auth(bob, 500, bob_policy);
     genesis.genesis_account_with_auth(carol, 250, carol_policy.clone());
     genesis.genesis_account_with_auth(eve, 5, eve_policy);
+    genesis.genesis_account_with_auth(reserve, 10_000, AuthPolicy::SingleKey(reserve_kp.public()));
     println!("Genesis (account ids commit to their auth policies):");
-    println!("  alice  {:?}  single-key, balance 1000", alice.0);
-    println!("  bob    {:?}  single-key, balance  500", bob.0);
-    println!("  carol  {:?}  2-of-3 threshold, balance 250", carol.0);
-    println!("  eve    {:?}  single-key, balance    5", eve.0);
+    println!("  alice   {:?}  single-key, balance 1000", alice.0);
+    println!("  bob     {:?}  single-key, balance  500", bob.0);
+    println!("  carol   {:?}  2-of-3 threshold, balance 250", carol.0);
+    println!("  eve     {:?}  single-key, balance    5", eve.0);
+    println!("  reserve {:?}  bridge reserve, balance 10000", reserve.0);
     println!("  SMT state root: {:?}", genesis.root());
     println!("  total supply: {} figs\n", genesis.total_supply());
 
@@ -342,21 +364,139 @@ fn main() {
         other => panic!("authorized mint should commit, got {other:?}"),
     }
 
+    // --- Cross-chain interop: trust-minimized bridge ---------------------------
+    println!("--- interop: bridging in from a foreign proof-of-work chain ---");
+    let mut bridge = BridgeHub::new(engine.chain_id, Keypair::from_label("phi-bridge-reserve"));
+    let btc = ForeignChainId(0xB7C);
+    // An easy difficulty target (first byte zero) keeps the demo instant.
+    let mut pow_target = [0xffu8; 32];
+    pow_target[0] = 0x00;
+    let foreign_genesis = ForeignHeader {
+        height: 0,
+        parent: Hash::ZERO,
+        event_root: merkle::root(&[]),
+        nonce: 0,
+    };
+    let pow = PowLightClient::new(&foreign_genesis, pow_target);
+
+    // The foreign chain locks 250 units destined for frank on Phi, committing
+    // the event in its block 1.
+    let lock = CrossChainEvent {
+        foreign_chain: btc,
+        sequence: 0,
+        beneficiary: frank,
+        amount: 250,
+    };
+    let leaves = vec![lock.hash()];
+    let foreign_block = pow.mine(ForeignHeader {
+        height: 1,
+        parent: foreign_genesis.hash(),
+        event_root: merkle::root(&leaves),
+        nonce: 0,
+    });
+    bridge.register_chain(btc, pow).unwrap();
+    bridge
+        .submit_foreign_header(btc, &foreign_block, &ConsensusProof::Pow)
+        .unwrap();
+    println!(
+        "  verified foreign PoW header at height {} (no trusted relayer)",
+        bridge.tip_height(btc).unwrap()
+    );
+
+    // A relayer presents the lock + an inclusion proof; the bridge verifies it
+    // against the foreign chain's own work and releases figs from the reserve.
+    let proof = EventProof {
+        header_height: 1,
+        leaf_index: 0,
+        leaf_count: 1,
+        merkle: merkle::prove(&leaves, 0).unwrap(),
+    };
+    let reserve_nonce = engine.canonical_state().account(&reserve).unwrap().nonce;
+    // Phase 1: verify the lock and build the release (not yet marked done).
+    let release_tx = bridge
+        .prepare_redemption(&lock, &proof, reserve_nonce)
+        .unwrap();
+    mempool
+        .submit(release_tx, engine.canonical_state())
+        .unwrap();
+    println!("  release verified; submitting reserve->frank transfer to consensus:");
+    while !mempool.is_empty() {
+        let batch = mempool.take_batch(1);
+        run_round(&mut engine, &mut mempool, batch);
+    }
+    assert_eq!(engine.canonical_state().balance(&frank), 250);
+    // Phase 2: the release committed, so mark the lock settled.
+    bridge
+        .confirm_redemption(lock.foreign_chain, lock.sequence)
+        .unwrap();
+
+    // The same foreign lock cannot be redeemed again.
+    match bridge.prepare_redemption(&lock, &proof, reserve_nonce + 1) {
+        Err(phi_interop::InteropError::AlreadyProcessed { .. }) => {
+            println!("  replay of the same foreign lock rejected ✓\n")
+        }
+        other => panic!("expected replay rejection, got {other:?}"),
+    }
+
+    // --- Smart contracts: PhiVM (deterministic, gas-metered) -------------------
+    // Standalone VM demo: contracts run here but are not yet wired into the
+    // ledger's state transition (the next integration step — see phi-vm docs).
+    println!("--- smart contracts: PhiVM (deterministic, gas-metered) ---");
+    let mut token = phi_vm::Contract::new(phi_vm::token_contract());
+    let (vm_alice, vm_bob) = (0xA11CE_u64, 0xB0B_u64);
+    token.storage.insert(vm_alice, 100); // seed alice with 100 tokens
+    let gas = 10_000;
+    let ok = token
+        .call(
+            &phi_vm::CallContext {
+                caller: vm_alice,
+                args: vec![phi_vm::token::TRANSFER, vm_bob, 30],
+                ..Default::default()
+            },
+            gas,
+        )
+        .unwrap();
+    println!(
+        "  token.transfer(alice->bob, 30) -> ret={:?}, gas_used={}",
+        ok.return_value, ok.gas_used
+    );
+    println!(
+        "  balances: alice={} bob={}",
+        token.storage[&vm_alice], token.storage[&vm_bob]
+    );
+    let before = token.storage.clone();
+    let overspend = token.call(
+        &phi_vm::CallContext {
+            caller: vm_alice,
+            args: vec![phi_vm::token::TRANSFER, vm_bob, 1_000],
+            ..Default::default()
+        },
+        gas,
+    );
+    println!("  token.transfer(alice->bob, 1000) -> {overspend:?} (atomic revert)");
+    assert_eq!(
+        token.storage, before,
+        "reverted call must not change balances"
+    );
+    println!("  contract code hash: {:?}\n", token.code_hash());
+
     // --- Final state ----------------------------------------------------------
     let state = engine.canonical_state();
     println!("=== Final state at height {} ===", engine.height);
-    for id in [alice, bob, carol, dave, eve] {
+    for id in [alice, bob, carol, dave, eve, reserve, frank] {
         let account = state.account(&id).unwrap();
         println!(
-            "  {:6} balance={:<5} nonce={}",
+            "  {:8} balance={:<6} nonce={}",
             name(&id),
             account.balance,
             account.nonce
         );
     }
-    assert_eq!(state.total_supply(), 1_755 + 100);
+    // Genesis 11,755 figs (incl. 10k reserve) + 100 authorized issuance.
+    // The bridge release moves figs within Phi, so supply is unchanged by it.
+    assert_eq!(state.total_supply(), 11_755 + 100);
     println!(
-        "  total supply = {} figs (genesis 1755 + 100 authorized issuance)",
+        "  total supply = {} figs (genesis 11,755 + 100 issuance; bridge moves, never mints)",
         state.total_supply()
     );
     println!("  final state root: {:?}", state.root());

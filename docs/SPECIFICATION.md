@@ -114,6 +114,14 @@ sortition ("PhiBFT").
 (inspired by Move) and **object-scoped parallelism** (inspired by Sui/Solana's
 access lists, generalized).
 
+> **Implemented (`phi-vm`):** a self-contained deterministic, gas-metered
+> bytecode VM with the execution-model properties the WASM target needs —
+> integer-only operands, bounded stack, gas-bounded termination, and atomic
+> revert-on-trap — with an example token contract. The WASM core below is the
+> production path; the bytecode VM proves the model without a heavy dependency.
+> Ledger integration (`Deploy`/`Call` tx kinds, contract storage in the SMT)
+> is the next step (docs/ROADMAP.md Phase 2).
+
 - **WASM core:** mature toolchains, sandboxing, metering, multiple source
   languages (Rust first-class; AssemblyScript/Go later). Determinism enforced
   by stripping floats/NaN nondeterminism, fixed memory/page limits, and gas
@@ -297,6 +305,34 @@ and supply integrity are governed by the Cargo guard sub-protocol (§12).
 - **Internal interop is trivial:** lanes share one security domain and one DA
   layer, so "cross-shard" calls are just ordered messages — no bridges between
   lanes.
+
+### Implemented in this repository (`phi-interop`)
+
+The light-client approach is real, not aspirational. `phi-interop` provides a
+pluggable `LightClient` trait with two reference adapters covering the dominant
+consensus families:
+
+- **`PowLightClient`** — proof-of-work SPV header verification (Bitcoin-style):
+  accept a header iff it links to the trusted tip and its hash meets the
+  difficulty target.
+- **`BftLightClient`** — validator-set quorum-signature verification
+  (Tendermint/Cosmos/Solana-style): accept a header iff a quorum of *distinct*
+  foreign validators signed it (strict Ed25519, mirroring Phi's own QC rule).
+
+A `BridgeHub` verifies a foreign lock event against the correct light client
+(consensus check + Merkle inclusion proof under a verified header), then
+releases the matching amount from a pre-funded **reserve account** — so the
+bridge *moves* figs rather than minting them, leaving total supply and the
+Cargo audit untouched. Inbound replay is blocked by recording redeemed foreign
+sequence numbers; outbound by a monotonic counter the foreign side tracks.
+
+Honest scope: this is light-client/SPV verification, not yet the ZK-SNARK
+aggregation §11 envisions (Phase 3). Validator-set rotation / weak
+subjectivity, PoW retargeting and most-work fork choice, and the foreign-side
+contracts that honor release instructions are out of scope for the current
+slice. Adding a specific chain means implementing `LightClient` for its exact
+rules — there is no universal "compatible with every chain" switch, because
+each chain's finality differs. See `SECURITY.md`.
 
 ---
 

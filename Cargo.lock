@@ -245,6 +245,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "phi-interop"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "phi-crypto",
+ "phi-types",
+]
+
+[[package]]
 name = "phi-mempool"
 version = "0.1.0"
 dependencies = [
@@ -261,9 +270,11 @@ dependencies = [
  "phi-consensus",
  "phi-crypto",
  "phi-executor",
+ "phi-interop",
  "phi-mempool",
  "phi-state",
  "phi-types",
+ "phi-vm",
 ]
 
 [[package]]
@@ -280,6 +291,13 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "phi-crypto",
+]
+
+[[package]]
+name = "phi-vm"
+version = "0.1.0"
+dependencies = [
+ "phi-types",
 ]
 
 [[package]]
