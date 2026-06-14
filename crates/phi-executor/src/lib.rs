@@ -26,6 +26,10 @@ use phi_types::{AccountId, Hash, Transaction};
 pub struct ExecutionOutput {
     pub state_root: Hash,
     pub receipts: Vec<Receipt>,
+    /// Total figs burned as inclusion fees across the batch (the sum of every
+    /// receipt's `fee_paid`). The Cargo supply audit reconciles this against
+    /// the change in total supply.
+    pub fees_burned: u64,
 }
 
 /// Partition `txs` (by index) into waves of mutually disjoint transactions.
@@ -64,6 +68,9 @@ fn touchable_accounts(tx: &Transaction) -> BTreeSet<AccountId> {
     let mut ids: BTreeSet<AccountId> = tx.access.reads.iter().copied().collect();
     ids.extend(tx.access.writes.iter().copied());
     ids.insert(tx.sender);
+    if let Some(sponsor) = tx.sponsor {
+        ids.insert(sponsor);
+    }
     match &tx.kind {
         phi_types::TransactionKind::Transfer { to, .. }
         | phi_types::TransactionKind::Mint { to, .. } => {
@@ -114,12 +121,15 @@ pub fn execute(state: &mut State, txs: &[Transaction]) -> ExecutionOutput {
         }
     }
 
+    let receipts: Vec<Receipt> = receipts
+        .into_iter()
+        .map(|r| r.expect("every tx scheduled exactly once"))
+        .collect();
+    let fees_burned = receipts.iter().map(|r| r.fee_paid).sum();
     ExecutionOutput {
         state_root: state.root(),
-        receipts: receipts
-            .into_iter()
-            .map(|r| r.expect("every tx scheduled exactly once"))
-            .collect(),
+        receipts,
+        fees_burned,
     }
 }
 
@@ -181,10 +191,12 @@ mod tests {
 
     /// Serial reference: receipts + root from `State::apply_tx` in order.
     fn serial(state: &mut State, txs: &[Transaction]) -> ExecutionOutput {
-        let receipts = txs.iter().map(|tx| state.apply_tx(tx)).collect();
+        let receipts: Vec<Receipt> = txs.iter().map(|tx| state.apply_tx(tx)).collect();
+        let fees_burned = receipts.iter().map(|r| r.fee_paid).sum();
         ExecutionOutput {
             state_root: state.root(),
             receipts,
+            fees_burned,
         }
     }
 
@@ -258,6 +270,44 @@ mod tests {
         let actual = execute(&mut parallel_state, &txs);
         assert!(actual.receipts.iter().all(|r| r.result.is_ok()));
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn fees_burn_in_parallel_exactly_as_serially() {
+        // base_fee burns figs from each payer; a sponsored transfer debits
+        // the sponsor. Parallel execution must reproduce serial byte-for-byte
+        // including the post-supply drop and the reported fees_burned.
+        let mut state = State::new();
+        state.set_base_fee(7);
+        state.genesis_account(id("alice"), 1_000);
+        state.genesis_account(id("bob"), 1_000);
+        state.genesis_account(id("treasury"), 1_000);
+
+        let txs = vec![
+            // alice pays her own fee (disjoint from bob's transfer -> 1 wave).
+            Transaction::transfer(id("alice"), 0, id("carol"), 100).with_max_fee(7),
+            Transaction::transfer(id("bob"), 0, id("dave"), 50).with_max_fee(7),
+            // treasury sponsors alice's second transfer's fee.
+            Transaction::transfer(id("alice"), 1, id("carol"), 100)
+                .with_max_fee(7)
+                .with_sponsor(id("treasury")),
+        ];
+
+        let mut serial_state = state.clone();
+        let expected = serial(&mut serial_state, &txs);
+        let actual = execute(&mut state, &txs);
+
+        assert_eq!(expected, actual);
+        assert!(actual.receipts.iter().all(|r| r.result.is_ok()));
+        // Three successful transactions at 7 figs each.
+        assert_eq!(actual.fees_burned, 21);
+        // Pre-supply 3000 less the 21 burned.
+        assert_eq!(state.total_supply(), 2_979);
+        // The treasury footed only the third fee; alice paid the other one.
+        assert_eq!(state.balance(&id("treasury")), 993);
+        // alice sent 200 across two transfers but only burned the fee on the
+        // first (the sponsor covered the second).
+        assert_eq!(state.balance(&id("alice")), 1_000 - 200 - 7);
     }
 
     #[test]

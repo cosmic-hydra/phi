@@ -17,10 +17,11 @@ trusted.
 | **CPU exhaustion via huge transactions** | Access-set size, signature count, and revealed-key count are bounded as consensus rules, checked before any signature work. | `phi-state::limits` |
 | **Memory exhaustion via mempool flooding** | Global pending-capacity bound plus per-sender free-lane quota and balance/nonce projection. | `phi-mempool` |
 | **Supply corruption via arithmetic bugs** | Checked arithmetic everywhere; on any invariant violation the node halts (panics) rather than silently wrapping — safety over liveness. Supply is tracked in `u128`. | `phi-state` |
-| **Equivocation / forged votes** | Votes are Ed25519-signed; quorum certificates require `> 2/3` *distinct* signers, each signature verified against the validator set. | `phi-consensus` |
+| **Equivocation / forged votes** | Votes are Ed25519-signed and bound to their consensus *view*; quorum certificates require `> 2/3` *distinct* signers, each signature verified against the validator set. A validator that double-signs within one view produces `SlashingEvidence` any light client can verify. | `phi-consensus` |
 | **Byzantine proposer** (corrupt state root, blind votes) | Validators independently re-execute and refuse incorrect roots; a failed round triggers view change and re-queues the batch. | `phi-consensus` |
 | **State/ledger transition bugs** | The parallel executor is property- and fuzz-tested to be byte-identical to serial execution; sandboxes inherit consensus config so they cannot diverge. | `phi-executor` |
 | **Light-client deception** | Sparse-Merkle-Tree state commitment with inclusion *and* exclusion proofs; Merkle transaction-inclusion proofs; QC chain verification. | `phi-state::smt`, `phi-types::merkle` |
+| **Fee-driven supply leaks** | The base fee is *burned* (EIP-1559 style) and committed per-transaction in the receipts root; the Cargo supply audit reconciles `post = pre + minted - burned` and refuses any block whose figs do not balance. | `phi-state`, `phi-cargo` |
 | **Nonce griefing** | Invalid transactions (bad auth/nonce/access/chain/oversize) consume nothing; only genuinely authorized runtime failures consume the nonce. | `phi-state` |
 | **Empty/degenerate validator set** | Constructing a consensus engine with zero validators panics rather than producing a chain with no quorum. | `phi-consensus` |
 
@@ -32,8 +33,10 @@ are designed-for but **not implemented**, and must not be relied on:
 - **Real networking and its attacks** (eclipse, partition, gossip-level DoS,
   adaptive-adversary timing). Consensus runs in-process with honest message
   delivery.
-- **Slashing** of equivocating/unavailable validators (evidence is not yet
-  produced or punished).
+- **Slashing** of equivocating/unavailable validators: equivocation
+  *evidence* is now produced and verifiable (`SlashingEvidence`), but nothing
+  yet **punishes** it (no stake, no burn), and validator *unavailability* is
+  not detected at all.
 - **Pacemaker / liveness under asynchrony** beyond the simple view-change
   shown here.
 - **Key management** (HSM/keystore, rotation, forward security). Simulation

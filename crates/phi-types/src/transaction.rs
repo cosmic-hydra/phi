@@ -153,6 +153,33 @@ impl Transaction {
         self
     }
 
+    /// Set the maximum fee the sender will pay for inclusion (builder; call
+    /// before signing — `max_fee` is covered by the id). A transaction is
+    /// only includable while the network's `base_fee` does not exceed this
+    /// cap (the sender's acceptance, à la EIP-1559's `maxFeePerGas`).
+    pub fn with_max_fee(mut self, max_fee: u64) -> Self {
+        self.max_fee = max_fee;
+        self
+    }
+
+    /// Nominate a sponsor to pay this transaction's fee on the sender's
+    /// behalf (native fee sponsorship, builder; call before signing). The
+    /// sponsor is added to the declared write set so the executor schedules
+    /// and sandboxes it correctly — its balance is debited by the fee.
+    pub fn with_sponsor(mut self, sponsor: AccountId) -> Self {
+        self.sponsor = Some(sponsor);
+        if !self.access.writes.contains(&sponsor) {
+            self.access.writes.push(sponsor);
+        }
+        self
+    }
+
+    /// The account that pays this transaction's fee: the sponsor when set,
+    /// otherwise the sender itself.
+    pub fn fee_payer(&self) -> AccountId {
+        self.sponsor.unwrap_or(self.sender)
+    }
+
     /// Attach the first-spend auth reveal (builder; call before signing —
     /// the reveal is covered by the id).
     pub fn with_reveal(mut self, policy: AuthPolicy, salt: u64) -> Self {

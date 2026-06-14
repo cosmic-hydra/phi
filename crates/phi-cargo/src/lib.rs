@@ -48,8 +48,8 @@ pub enum AuditViolation {
     UnauthorizedMint { tx_id: Hash },
     /// Successful mints in this block exceed the per-block issuance cap.
     MintCapExceeded { minted: u64, cap: u64 },
-    /// Post-state fig supply differs from pre-supply + authorized issuance:
-    /// somewhere, figs were conjured or destroyed.
+    /// Post-state fig supply differs from pre-supply + authorized issuance -
+    /// burned inclusion fees: somewhere, figs were conjured or destroyed.
     SupplyMismatch { expected: u128, actual: u128 },
 }
 
@@ -85,8 +85,9 @@ impl FigGovernor {
     /// Validator-side audit, run against a proposal before voting:
     /// every *successful* mint must come from the authorized minter and fit
     /// the per-block cap, and the supply delta must equal authorized
-    /// issuance exactly. `txs` and `receipts` must correspond pairwise (both
-    /// come from the validator's own re-execution).
+    /// issuance minus burned inclusion fees exactly. `txs` and `receipts`
+    /// must correspond pairwise (both come from the validator's own
+    /// re-execution); burned fees are read from the receipts.
     pub fn audit_block(
         &self,
         pre_supply: u128,
@@ -113,7 +114,11 @@ impl FigGovernor {
                 cap: self.max_mint_per_block,
             });
         }
-        let expected = pre_supply + minted as u128;
+        // Figs created by authorized issuance, less figs burned as inclusion
+        // fees, must exactly account for the change in total supply. Any
+        // other delta means execution conjured or destroyed figs.
+        let burned: u128 = receipts.iter().map(|r| r.fee_paid as u128).sum();
+        let expected = (pre_supply + minted as u128).saturating_sub(burned);
         if expected != post_supply {
             return Err(AuditViolation::SupplyMismatch {
                 expected,
@@ -418,6 +423,7 @@ mod tests {
         let receipts = vec![Receipt {
             tx_id: forged.id(),
             result: Ok(()), // pretend execution wrongly accepted it
+            fee_paid: 0,
         }];
         let outcome = governor.audit_block(0, 1_000_000, std::slice::from_ref(&forged), &receipts);
         assert!(matches!(
@@ -467,5 +473,36 @@ mod tests {
             })
         );
         assert_eq!(governor.audit_block(1_000, 1_000, &[], &[]), Ok(()));
+    }
+
+    #[test]
+    fn audit_reconciles_burned_inclusion_fees() {
+        // With a non-zero base_fee, successful transactions burn figs. The
+        // audit expects `post = pre + minted - burned`, so an honest block
+        // that burns fees passes, while receipts that under-report the burn
+        // (a would-be supply leak) are caught.
+        let mut state = State::new();
+        state.set_base_fee(5);
+        state.genesis_account(id("alice"), 100);
+        state.genesis_account(id("bob"), 0);
+        let governor = FigGovernor::default(); // issuance frozen; only fees move supply
+
+        let txs = vec![Transaction::transfer(id("alice"), 0, id("bob"), 40).with_max_fee(5)];
+        let pre = state.total_supply();
+        let receipts: Vec<Receipt> = txs.iter().map(|tx| state.apply_tx(tx)).collect();
+        assert_eq!(receipts[0].fee_paid, 5);
+        assert_eq!(state.total_supply(), pre - 5);
+        assert_eq!(
+            governor.audit_block(pre, state.total_supply(), &txs, &receipts),
+            Ok(())
+        );
+
+        // A receipt that under-reports the burn no longer reconciles.
+        let mut lying = receipts.clone();
+        lying[0].fee_paid = 0;
+        assert!(matches!(
+            governor.audit_block(pre, state.total_supply(), &txs, &lying),
+            Err(AuditViolation::SupplyMismatch { .. })
+        ));
     }
 }

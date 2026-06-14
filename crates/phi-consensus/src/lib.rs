@@ -17,13 +17,18 @@ use phi_executor::ExecutionOutput;
 use phi_state::{receipts_root, Receipt, State};
 use phi_types::{AccountId, Block, BlockHeader, Hash, Transaction};
 
-/// Canonical message a validator signs when voting on a proposal.
-pub fn vote_message(block_hash: &Hash, height: u64, approve: bool) -> Hash {
+/// Canonical message a validator signs when voting on a proposal. The
+/// `view` binds the vote to a single consensus round, which is what makes
+/// equivocation (double-voting within one view) a well-defined, provable
+/// fault — an honest validator legitimately votes for different blocks at the
+/// same *height* across views, but never twice in the same view.
+pub fn vote_message(block_hash: &Hash, height: u64, view: u64, approve: bool) -> Hash {
     Hash::of_tagged(
         b"phi:vote",
         &[
             block_hash.as_bytes(),
             &height.to_le_bytes(),
+            &view.to_le_bytes(),
             &[approve as u8],
         ],
     )
@@ -35,6 +40,9 @@ pub struct Vote {
     pub validator: u32,
     pub block_hash: Hash,
     pub height: u64,
+    /// Consensus view (round) this vote was cast in. Two distinct votes from
+    /// one validator sharing a view are equivocation.
+    pub view: u64,
     pub approve: bool,
     pub signature: Signature,
 }
@@ -45,7 +53,7 @@ impl Vote {
         let Some(key) = validator_keys.get(self.validator as usize) else {
             return false;
         };
-        let message = vote_message(&self.block_hash, self.height, self.approve);
+        let message = vote_message(&self.block_hash, self.height, self.view, self.approve);
         key.verify(message.as_bytes(), &self.signature)
     }
 }
@@ -57,6 +65,8 @@ impl Vote {
 pub struct QuorumCertificate {
     pub block_hash: Hash,
     pub height: u64,
+    /// View the certified votes were cast in (every signature covers it).
+    pub view: u64,
     pub signers: Vec<u32>,
     pub signatures: Vec<Signature>,
 }
@@ -73,7 +83,7 @@ impl QuorumCertificate {
         if seen.len() != self.signers.len() {
             return false;
         }
-        let message = vote_message(&self.block_hash, self.height, true);
+        let message = vote_message(&self.block_hash, self.height, self.view, true);
         self.signers
             .iter()
             .zip(&self.signatures)
@@ -82,6 +92,77 @@ impl QuorumCertificate {
                     .get(*signer as usize)
                     .is_some_and(|key| key.verify(message.as_bytes(), signature))
             })
+    }
+}
+
+/// Irrefutable proof that one validator equivocated: two validly signed votes
+/// from the same validator in the same view that disagree (different block or
+/// different approve bit). This is the canonical slashable Byzantine fault —
+/// a correct validator signs at most one vote per view, so producing two is
+/// cryptographic self-incrimination. In production this evidence is gossiped
+/// and burns the offender's stake (docs/SPECIFICATION.md §11).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlashingEvidence {
+    pub validator: u32,
+    pub view: u64,
+    pub vote_a: Vote,
+    pub vote_b: Vote,
+}
+
+impl SlashingEvidence {
+    /// Both votes must be validly signed by the accused validator in the
+    /// accused view, and must genuinely conflict. Anyone — including a light
+    /// client — can check this against the validator set, with no trust in
+    /// the reporter.
+    pub fn verify(&self, validator_keys: &[PublicKey]) -> bool {
+        self.vote_a.validator == self.validator
+            && self.vote_b.validator == self.validator
+            && self.vote_a.view == self.view
+            && self.vote_b.view == self.view
+            && self.conflicting()
+            && self.vote_a.verify(validator_keys)
+            && self.vote_b.verify(validator_keys)
+    }
+
+    /// The two votes disagree (different target block or different approval),
+    /// rather than being a harmless rebroadcast of an identical vote.
+    fn conflicting(&self) -> bool {
+        self.vote_a.block_hash != self.vote_b.block_hash
+            || self.vote_a.approve != self.vote_b.approve
+    }
+}
+
+/// Watches a stream of votes and surfaces [`SlashingEvidence`] the moment a
+/// validator casts a second, conflicting vote in a view it has already voted
+/// in. Deterministic and append-only: feeding the same votes in any order
+/// detects the same equivocations.
+#[derive(Default)]
+pub struct EquivocationDetector {
+    seen: std::collections::HashMap<(u32, u64), Vote>,
+}
+
+impl EquivocationDetector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record `vote`. Returns evidence if it conflicts with an earlier vote
+    /// from the same validator in the same view; otherwise `None` (and an
+    /// identical rebroadcast is ignored).
+    pub fn observe(&mut self, vote: Vote) -> Option<SlashingEvidence> {
+        match self.seen.get(&(vote.validator, vote.view)) {
+            Some(prior) if prior != &vote => Some(SlashingEvidence {
+                validator: vote.validator,
+                view: vote.view,
+                vote_a: prior.clone(),
+                vote_b: vote,
+            }),
+            Some(_) => None, // identical vote re-seen: not a fault
+            None => {
+                self.seen.insert((vote.validator, vote.view), vote);
+                None
+            }
+        }
     }
 }
 
@@ -143,8 +224,9 @@ impl Validator {
     /// the Cargo guard audit — a block that inflates fig supply or mints
     /// without authority is refused even though its roots are self-
     /// consistent. A block for the wrong network or one exceeding the
-    /// per-block transaction limit is refused outright.
-    pub fn vote(&self, block: &Block) -> Vote {
+    /// per-block transaction limit is refused outright. The resulting vote is
+    /// bound to `view` so it cannot be replayed into another round.
+    pub fn vote(&self, block: &Block, view: u64) -> Vote {
         let approve = if self.byzantine {
             true // votes blindly for anything, including corrupt proposals
         } else {
@@ -166,12 +248,20 @@ impl Validator {
                     )
                     .is_ok()
         };
-        let block_hash = block.header.hash();
-        let message = vote_message(&block_hash, block.header.height, approve);
+        self.sign_vote(block.header.hash(), block.header.height, view, approve)
+    }
+
+    /// Sign a vote for an arbitrary (block, height, view, approve) tuple. The
+    /// honest path goes through [`Validator::vote`]; this lower-level helper
+    /// exists so a Byzantine validator can be made to *equivocate* (sign two
+    /// conflicting votes in one view) for slashing demonstrations and tests.
+    pub fn sign_vote(&self, block_hash: Hash, height: u64, view: u64, approve: bool) -> Vote {
+        let message = vote_message(&block_hash, height, view, approve);
         Vote {
             validator: self.index,
             block_hash,
-            height: block.header.height,
+            height,
+            view,
             approve,
             signature: self.keypair.sign(message.as_bytes()),
         }
@@ -203,6 +293,11 @@ pub struct ConsensusEngine {
     /// Committed blocks with their quorum certificates (the light-client
     /// auditable chain).
     pub chain: Vec<(Block, QuorumCertificate)>,
+    /// Slashing evidence collected across all rounds: any validator that
+    /// signs two conflicting votes in one view incriminates itself here.
+    pub slashing_evidence: Vec<SlashingEvidence>,
+    /// Watches every vote the engine observes for equivocation.
+    detector: EquivocationDetector,
 }
 
 impl ConsensusEngine {
@@ -225,6 +320,8 @@ impl ConsensusEngine {
             chain_id,
             view: 0,
             chain: Vec::new(),
+            slashing_evidence: Vec::new(),
+            detector: EquivocationDetector::new(),
         }
     }
 
@@ -253,6 +350,7 @@ impl ConsensusEngine {
         let ExecutionOutput {
             mut state_root,
             receipts,
+            ..
         } = phi_executor::execute(&mut scratch, &txs);
         if proposer.byzantine {
             state_root.0[0] ^= 0xff; // claims a state it did not compute
@@ -274,8 +372,11 @@ impl ConsensusEngine {
 
     /// Run one round: propose, gather signed votes, verify them, build and
     /// check the quorum certificate, commit on quorum. On failure the view
-    /// advances and the batch is returned for re-queuing.
+    /// advances and the batch is returned for re-queuing. Every verified vote
+    /// is fed to the equivocation detector, so a validator that double-signs
+    /// is recorded in [`ConsensusEngine::slashing_evidence`].
     pub fn run_round(&mut self, txs: Vec<Transaction>, timestamp_ms: u64) -> RoundOutcome {
+        let view = self.view;
         let block = self.propose(txs, timestamp_ms);
         let block_hash = block.header.hash();
         let keys = self.validator_keys();
@@ -284,9 +385,14 @@ impl ConsensusEngine {
         let votes: Vec<Vote> = self
             .validators
             .iter()
-            .map(|v| v.vote(&block))
+            .map(|v| v.vote(&block, view))
             .filter(|vote| vote.block_hash == block_hash && vote.verify(&keys))
             .collect();
+        for vote in &votes {
+            if let Some(evidence) = self.detector.observe(vote.clone()) {
+                self.slashing_evidence.push(evidence);
+            }
+        }
         let approving: Vec<&Vote> = votes.iter().filter(|v| v.approve).collect();
         let needed = self.quorum();
         self.view += 1;
@@ -303,6 +409,7 @@ impl ConsensusEngine {
         let qc = QuorumCertificate {
             block_hash,
             height: block.header.height,
+            view,
             signers: approving.iter().map(|v| v.validator).collect(),
             signatures: approving.iter().map(|v| v.signature).collect(),
         };
@@ -352,6 +459,23 @@ impl ConsensusEngine {
     pub fn canonical_state(&self) -> &State {
         &self.validators[0].state
     }
+
+    /// Feed a vote observed off the wire (e.g. gossiped by a peer) into the
+    /// equivocation detector. If it conflicts with a vote the same validator
+    /// already cast in that view, the returned evidence is also recorded in
+    /// [`ConsensusEngine::slashing_evidence`]. This is how a double-signing
+    /// validator is caught even when its second vote never reached quorum.
+    pub fn observe_external_vote(&mut self, vote: Vote) -> Option<SlashingEvidence> {
+        let keys = self.validator_keys();
+        if !vote.verify(&keys) {
+            return None; // unsigned or forged: not admissible evidence
+        }
+        let evidence = self.detector.observe(vote);
+        if let Some(evidence) = &evidence {
+            self.slashing_evidence.push(evidence.clone());
+        }
+        evidence
+    }
 }
 
 #[cfg(test)]
@@ -400,7 +524,7 @@ mod tests {
         let approvals = engine
             .validators
             .iter()
-            .filter(|v| v.vote(&block).approve)
+            .filter(|v| v.vote(&block, engine.view).approve)
             .count();
         assert_eq!(approvals, 0);
     }
@@ -559,7 +683,7 @@ mod tests {
         let engine = ConsensusEngine::new(4, genesis());
         let block = engine.propose(vec![Transaction::transfer(id("alice"), 0, id("bob"), 1)], 1);
         assert!(block.transactions.len() <= MAX_BLOCK_TXS);
-        assert!(engine.validators[1].vote(&block).approve);
+        assert!(engine.validators[1].vote(&block, engine.view).approve);
     }
 
     #[test]
@@ -569,6 +693,116 @@ mod tests {
             engine.propose(vec![Transaction::transfer(id("alice"), 0, id("bob"), 1)], 1);
         // Re-stamp the header for a different network; honest voters refuse.
         block.header.chain_id = 999;
-        assert!(!engine.validators[1].vote(&block).approve);
+        assert!(!engine.validators[1].vote(&block, engine.view).approve);
+    }
+
+    #[test]
+    fn detector_flags_only_genuine_equivocation() {
+        let engine = ConsensusEngine::new(4, genesis());
+        let keys = engine.validator_keys();
+        let v = &engine.validators[1];
+        let mut detector = EquivocationDetector::new();
+
+        let vote = v.sign_vote(Hash::of(b"block-A"), 1, 0, true);
+        assert!(detector.observe(vote.clone()).is_none(), "first vote is fine");
+        // An identical rebroadcast is not a fault.
+        assert!(detector.observe(vote).is_none());
+
+        // Same validator and view but a different block: equivocation.
+        let conflicting = v.sign_vote(Hash::of(b"block-B"), 1, 0, true);
+        let evidence = detector.observe(conflicting).expect("double-sign caught");
+        assert!(evidence.verify(&keys));
+        assert_eq!(evidence.validator, 1);
+
+        // A vote in a *different* view is legitimate (honest cross-view voting).
+        let next_view = v.sign_vote(Hash::of(b"block-C"), 1, 1, true);
+        assert!(detector.observe(next_view).is_none());
+    }
+
+    #[test]
+    fn forged_or_nonconflicting_evidence_is_rejected() {
+        let engine = ConsensusEngine::new(4, genesis());
+        let keys = engine.validator_keys();
+        let v2 = &engine.validators[2];
+
+        let a = v2.sign_vote(Hash::of(b"x"), 1, 0, true);
+        let b = v2.sign_vote(Hash::of(b"y"), 1, 0, true);
+
+        // Two identical votes do not conflict.
+        let identical = SlashingEvidence {
+            validator: 2,
+            view: 0,
+            vote_a: a.clone(),
+            vote_b: a.clone(),
+        };
+        assert!(!identical.verify(&keys));
+
+        // A real conflict but accusing the wrong validator fails.
+        let mislabeled = SlashingEvidence {
+            validator: 1,
+            view: 0,
+            vote_a: a.clone(),
+            vote_b: b.clone(),
+        };
+        assert!(!mislabeled.verify(&keys));
+
+        // Tampering with a signature breaks verification.
+        let mut tampered_b = b;
+        tampered_b.signature.0[0] ^= 0xff;
+        let tampered = SlashingEvidence {
+            validator: 2,
+            view: 0,
+            vote_a: a,
+            vote_b: tampered_b,
+        };
+        assert!(!tampered.verify(&keys));
+    }
+
+    #[test]
+    fn honest_consensus_produces_no_slashing_evidence() {
+        let mut engine = ConsensusEngine::new(4, genesis());
+        for i in 0..3 {
+            engine.run_round(vec![], i);
+        }
+        assert!(engine.slashing_evidence.is_empty());
+    }
+
+    #[test]
+    fn engine_records_equivocation_from_a_gossiped_double_vote() {
+        let mut engine = ConsensusEngine::new(4, genesis());
+        engine.validators[2].byzantine = true;
+
+        // View 0: a normal round. Every validator casts exactly one vote, so
+        // the detector sees no fault even from the Byzantine validator.
+        let RoundOutcome::Committed { .. } =
+            engine.run_round(vec![Transaction::transfer(id("alice"), 0, id("bob"), 1)], 1)
+        else {
+            panic!("expected commit");
+        };
+        assert!(engine.slashing_evidence.is_empty());
+
+        // The Byzantine validator gossips a SECOND, conflicting vote for the
+        // same view (a different block hash): provable double-signing.
+        let forged = engine.validators[2].sign_vote(Hash::of(b"a different block"), 1, 0, true);
+        let evidence = engine
+            .observe_external_vote(forged)
+            .expect("equivocation detected");
+
+        assert_eq!(evidence.validator, 2);
+        assert_eq!(evidence.view, 0);
+        assert!(evidence.verify(&engine.validator_keys()));
+        assert_eq!(engine.slashing_evidence.len(), 1);
+
+        // An unsigned/forged vote from an outsider is not admissible evidence.
+        let garbage = Vote {
+            validator: 0,
+            block_hash: Hash::of(b"z"),
+            height: 1,
+            view: 0,
+            approve: false,
+            signature: phi_crypto::Signature([0u8; phi_crypto::SIGNATURE_LEN]),
+        };
+        assert!(engine.observe_external_vote(garbage).is_none());
+        assert_eq!(engine.slashing_evidence.len(), 1);
     }
 }

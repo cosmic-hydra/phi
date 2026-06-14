@@ -45,6 +45,13 @@ pub enum TxError {
     /// (or issuance is frozen). Enforced by the base ledger itself, not only
     /// by the Cargo guard's block audit.
     UnauthorizedIssuance,
+    /// The network's `base_fee` exceeds the transaction's `max_fee` cap, so
+    /// the sender never agreed to this price. Like an underpriced Ethereum
+    /// transaction: invalid for inclusion, and the nonce is *not* consumed.
+    FeeTooLow {
+        base_fee: u64,
+        max_fee: u64,
+    },
     /// Spending from an unclaimed account requires revealing the auth policy
     /// committed to by the account id; the reveal is missing or mismatched
     /// (or present on an already-claimed account).
@@ -94,6 +101,12 @@ impl TxError {
             }
             TxError::TransactionTooLarge => vec![9],
             TxError::UnauthorizedIssuance => vec![10],
+            TxError::FeeTooLow { base_fee, max_fee } => {
+                let mut out = vec![11];
+                out.extend_from_slice(&base_fee.to_le_bytes());
+                out.extend_from_slice(&max_fee.to_le_bytes());
+                out
+            }
         }
     }
 }
@@ -115,6 +128,11 @@ pub mod limits {
 pub struct Receipt {
     pub tx_id: Hash,
     pub result: Result<(), TxError>,
+    /// Figs burned as the inclusion fee for this transaction (0 unless the
+    /// transaction succeeded under a non-zero `base_fee`). Committed in the
+    /// receipts root so light clients can audit fee burn, and summed by the
+    /// Cargo supply audit.
+    pub fee_paid: u64,
 }
 
 impl Receipt {
@@ -124,7 +142,14 @@ impl Receipt {
             Ok(()) => vec![0],
             Err(e) => e.encode(),
         };
-        Hash::of_tagged(b"phi:receipt", &[self.tx_id.as_bytes(), &encoded_result])
+        Hash::of_tagged(
+            b"phi:receipt",
+            &[
+                self.tx_id.as_bytes(),
+                &encoded_result,
+                &self.fee_paid.to_le_bytes(),
+            ],
+        )
     }
 }
 
@@ -136,15 +161,18 @@ pub fn receipts_root(receipts: &[Receipt]) -> Hash {
 
 /// The ledger state.
 ///
-/// Beyond the account map, `State` carries two consensus parameters that make
-/// the base ledger safe in isolation (not only behind the Cargo guard):
-/// `chain_id` (rejects foreign-network transactions) and `minter` (the sole
-/// account permitted to create figs; `None` freezes issuance entirely).
+/// Beyond the account map, `State` carries three consensus parameters that
+/// make the base ledger safe in isolation (not only behind the Cargo guard):
+/// `chain_id` (rejects foreign-network transactions), `minter` (the sole
+/// account permitted to create figs; `None` freezes issuance entirely), and
+/// `base_fee` (figs burned per included transaction; EIP-1559-style, `0`
+/// keeps the free lane).
 #[derive(Clone, Debug, Default)]
 pub struct State {
     accounts: BTreeMap<AccountId, Account>,
     chain_id: u64,
     minter: Option<AccountId>,
+    base_fee: u64,
 }
 
 fn account_value_hash(account: &Account) -> Hash {
@@ -166,15 +194,32 @@ impl State {
         self.chain_id = chain_id;
     }
 
+    /// Figs burned as the inclusion fee for every successful transaction
+    /// (consensus parameter; `0` = free lane). Burning the fee — rather than
+    /// paying it to the proposer — keeps execution embarrassingly parallel
+    /// (no account every transaction must write) and is conserved by the
+    /// Cargo supply audit, which expects `post = pre + minted - burned`.
+    pub fn base_fee(&self) -> u64 {
+        self.base_fee
+    }
+
+    /// Set the per-transaction inclusion fee (consensus parameter; in
+    /// production this tracks a congestion-driven fee market).
+    pub fn set_base_fee(&mut self, base_fee: u64) {
+        self.base_fee = base_fee;
+    }
+
     /// An empty state carrying the same consensus configuration (`chain_id`,
-    /// `minter`) but no accounts. The parallel executor builds per-transaction
-    /// sandboxes from this so validation inside a sandbox sees the same
-    /// issuance authority and network id as the real ledger.
+    /// `minter`, `base_fee`) but no accounts. The parallel executor builds
+    /// per-transaction sandboxes from this so validation inside a sandbox
+    /// sees the same issuance authority, network id, and fee as the real
+    /// ledger.
     pub fn empty_like(&self) -> Self {
         Self {
             accounts: BTreeMap::new(),
             chain_id: self.chain_id,
             minter: self.minter,
+            base_fee: self.base_fee,
         }
     }
 
@@ -276,6 +321,21 @@ impl State {
         Ok(())
     }
 
+    /// The inclusion fee for `tx` under the current `base_fee`, or
+    /// [`TxError::FeeTooLow`] when the network price exceeds the sender's
+    /// `max_fee` cap. State-config dependent only (no account lookups), so it
+    /// is a deterministic consensus rule.
+    fn inclusion_fee(&self, tx: &Transaction) -> Result<u64, TxError> {
+        let fee = self.base_fee;
+        if fee > tx.max_fee {
+            return Err(TxError::FeeTooLow {
+                base_fee: fee,
+                max_fee: tx.max_fee,
+            });
+        }
+        Ok(fee)
+    }
+
     /// Validate a transaction against current state without applying it.
     pub fn validate(&self, tx: &Transaction) -> Result<(), TxError> {
         // Cheapest, state-independent checks first.
@@ -293,13 +353,19 @@ impl State {
             .ok_or(TxError::UnknownSender)?;
 
         // The declared access set must cover everything execution touches:
-        // the sender (nonce, balance, auth) and the credited account. This is
-        // the invariant that makes scheduling by declared sets sound.
+        // the sender (nonce, balance, auth), the credited account, and any
+        // sponsor whose balance pays the fee. This is the invariant that
+        // makes scheduling by declared sets sound.
         let target = match &tx.kind {
             TransactionKind::Transfer { to, .. } | TransactionKind::Mint { to, .. } => to,
         };
         if !tx.access.writes.contains(&tx.sender) || !tx.access.writes.contains(target) {
             return Err(TxError::AccessViolation);
+        }
+        if let Some(sponsor) = tx.sponsor {
+            if !tx.access.writes.contains(&sponsor) {
+                return Err(TxError::AccessViolation);
+            }
         }
 
         if sender.nonce != tx.nonce {
@@ -311,12 +377,24 @@ impl State {
 
         self.verify_auth(sender, tx)?;
 
+        // Fee accounting: the network burns `base_fee` from the fee payer
+        // (sponsor when set, otherwise the sender) on success.
+        let fee = self.inclusion_fee(tx)?;
+        let sponsor_pays = tx.sponsor.is_some_and(|s| s != tx.sender);
+
         match &tx.kind {
             TransactionKind::Transfer { to, amount } => {
-                if sender.balance < *amount {
+                // The sender covers the transfer amount, plus the fee when it
+                // is also the fee payer (no distinct sponsor).
+                let sender_need = if sponsor_pays {
+                    *amount
+                } else {
+                    amount.checked_add(fee).ok_or(TxError::Overflow)?
+                };
+                if sender.balance < sender_need {
                     return Err(TxError::InsufficientBalance {
                         have: sender.balance,
-                        need: *amount,
+                        need: sender_need,
                     });
                 }
                 // Pre-check the credit so execution never partially applies.
@@ -337,6 +415,24 @@ impl State {
                 self.balance(to)
                     .checked_add(*amount)
                     .ok_or(TxError::Overflow)?;
+                // The minter, when it is also the fee payer, must cover the fee.
+                if !sponsor_pays && sender.balance < fee {
+                    return Err(TxError::InsufficientBalance {
+                        have: sender.balance,
+                        need: fee,
+                    });
+                }
+            }
+        }
+
+        // A distinct sponsor must exist and be able to cover the fee.
+        if sponsor_pays {
+            let sponsor_balance = self.balance(&tx.fee_payer());
+            if sponsor_balance < fee {
+                return Err(TxError::InsufficientBalance {
+                    have: sponsor_balance,
+                    need: fee,
+                });
             }
         }
         Ok(())
@@ -407,9 +503,14 @@ impl State {
             Ok(()) => true,
             Err(e) => e.consumes_nonce(),
         };
-        if result.is_ok() {
+        // The fee is burned only when the transaction actually executes; a
+        // runtime failure that merely consumes the nonce burns nothing.
+        let fee_paid = if result.is_ok() {
             self.execute(tx);
-        }
+            self.base_fee
+        } else {
+            0
+        };
         if consume_nonce {
             let sender = self.accounts.get_mut(&tx.sender).expect("validated sender");
             // Nonce overflow is unreachable in practice (2^64 txs); fail
@@ -419,6 +520,7 @@ impl State {
         Receipt {
             tx_id: tx.id(),
             result,
+            fee_paid,
         }
     }
 
@@ -459,6 +561,19 @@ impl State {
                     .checked_add(*amount)
                     .expect("validated: mint credit does not overflow");
             }
+        }
+        // Burn the inclusion fee from the fee payer (sponsor or sender). The
+        // figs leave circulation entirely; the Cargo supply audit expects
+        // exactly this drain (`post = pre + minted - burned`).
+        if self.base_fee > 0 {
+            let payer = self
+                .accounts
+                .get_mut(&tx.fee_payer())
+                .expect("validated fee payer exists");
+            payer.balance = payer
+                .balance
+                .checked_sub(self.base_fee)
+                .expect("validated: fee payer affords the fee");
         }
     }
 
@@ -848,15 +963,145 @@ mod tests {
         let ok = Receipt {
             tx_id: Hash::of(b"tx"),
             result: Ok(()),
+            fee_paid: 0,
         };
         let failed = Receipt {
             tx_id: Hash::of(b"tx"),
             result: Err(TxError::Overflow),
+            fee_paid: 0,
         };
         assert_ne!(
             receipts_root(std::slice::from_ref(&ok)),
             receipts_root(&[failed])
         );
         assert_ne!(receipts_root(&[]), receipts_root(&[ok]));
+    }
+
+    #[test]
+    fn base_fee_is_burned_on_success_and_recorded_in_the_receipt() {
+        let mut state = State::new();
+        state.set_base_fee(5);
+        state.genesis_account(id("alice"), 100);
+        state.genesis_account(id("bob"), 0);
+
+        let tx = Transaction::transfer(id("alice"), 0, id("bob"), 40).with_max_fee(5);
+        let receipt = state.apply_tx(&tx);
+        assert!(receipt.result.is_ok());
+        assert_eq!(receipt.fee_paid, 5);
+        // alice pays the 40 transfer and burns the 5 fee.
+        assert_eq!(state.balance(&id("alice")), 55);
+        assert_eq!(state.balance(&id("bob")), 40);
+        // The 5 figs left circulation entirely.
+        assert_eq!(state.total_supply(), 95);
+    }
+
+    #[test]
+    fn fee_too_low_is_invalid_and_burns_no_nonce() {
+        let mut state = State::new();
+        state.set_base_fee(10);
+        state.genesis_account(id("alice"), 100);
+
+        let underpriced = Transaction::transfer(id("alice"), 0, id("bob"), 1).with_max_fee(3);
+        let receipt = state.apply_tx(&underpriced);
+        assert_eq!(
+            receipt.result,
+            Err(TxError::FeeTooLow {
+                base_fee: 10,
+                max_fee: 3
+            })
+        );
+        // Invalid (not a runtime failure): nothing moved, nonce untouched.
+        assert_eq!(state.balance(&id("alice")), 100);
+        assert_eq!(state.account(&id("alice")).unwrap().nonce, 0);
+        assert_eq!(receipt.fee_paid, 0);
+    }
+
+    #[test]
+    fn fee_counts_against_the_senders_spendable_balance() {
+        let mut state = State::new();
+        state.set_base_fee(10);
+        state.genesis_account(id("alice"), 100);
+
+        // Exactly the balance as the amount leaves no room for the fee.
+        let cannot_afford_fee =
+            Transaction::transfer(id("alice"), 0, id("bob"), 100).with_max_fee(10);
+        assert_eq!(
+            state.apply_tx(&cannot_afford_fee).result,
+            Err(TxError::InsufficientBalance {
+                have: 100,
+                need: 110
+            })
+        );
+        // amount + fee within balance succeeds.
+        let ok = Transaction::transfer(id("alice"), 1, id("bob"), 90).with_max_fee(10);
+        assert!(state.apply_tx(&ok).result.is_ok());
+        assert_eq!(state.balance(&id("alice")), 0);
+    }
+
+    #[test]
+    fn a_sponsor_pays_the_fee_and_the_sender_keeps_the_full_amount() {
+        let mut state = State::new();
+        state.set_base_fee(8);
+        state.genesis_account(id("alice"), 50);
+        state.genesis_account(id("treasury"), 1_000);
+        state.genesis_account(id("bob"), 0);
+
+        // Alice spends her entire balance; the treasury sponsors the fee.
+        let tx = Transaction::transfer(id("alice"), 0, id("bob"), 50)
+            .with_max_fee(8)
+            .with_sponsor(id("treasury"));
+        let receipt = state.apply_tx(&tx);
+        assert!(receipt.result.is_ok(), "got {:?}", receipt.result);
+        assert_eq!(receipt.fee_paid, 8);
+        assert_eq!(state.balance(&id("alice")), 0);
+        assert_eq!(state.balance(&id("bob")), 50);
+        // The sponsor's balance footed the burned fee.
+        assert_eq!(state.balance(&id("treasury")), 992);
+        assert_eq!(state.total_supply(), 1_042);
+    }
+
+    #[test]
+    fn an_undeclared_sponsor_is_an_access_violation() {
+        let mut state = State::new();
+        state.set_base_fee(1);
+        state.genesis_account(id("alice"), 50);
+        state.genesis_account(id("treasury"), 10);
+
+        // Hand-built tx that names a sponsor without declaring it in writes.
+        let mut tx = Transaction::transfer(id("alice"), 0, id("bob"), 1).with_max_fee(1);
+        tx.sponsor = Some(id("treasury"));
+        assert_eq!(state.apply_tx(&tx).result, Err(TxError::AccessViolation));
+    }
+
+    #[test]
+    fn no_fee_is_burned_when_the_transaction_fails_at_runtime() {
+        let mut state = State::new();
+        state.set_base_fee(5);
+        state.genesis_account(id("alice"), 100);
+
+        // Overspend: runtime failure consumes the nonce but burns no fee.
+        let overspend = Transaction::transfer(id("alice"), 0, id("bob"), 1_000).with_max_fee(5);
+        let receipt = state.apply_tx(&overspend);
+        assert!(matches!(
+            receipt.result,
+            Err(TxError::InsufficientBalance { .. })
+        ));
+        assert_eq!(receipt.fee_paid, 0);
+        assert_eq!(state.balance(&id("alice")), 100);
+        assert_eq!(state.total_supply(), 100);
+        assert_eq!(state.account(&id("alice")).unwrap().nonce, 1);
+    }
+
+    #[test]
+    fn zero_base_fee_preserves_legacy_behavior() {
+        // The free lane: a transaction with no fee cap still works when the
+        // network price is zero, exactly as before fees existed.
+        let mut state = State::new();
+        state.genesis_account(id("alice"), 100);
+        let tx = Transaction::transfer(id("alice"), 0, id("bob"), 40);
+        let receipt = state.apply_tx(&tx);
+        assert!(receipt.result.is_ok());
+        assert_eq!(receipt.fee_paid, 0);
+        assert_eq!(state.total_supply(), 100);
     }
 }

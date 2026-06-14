@@ -435,5 +435,116 @@ fn main() {
     assert_eq!(replay.root(), state.root());
     println!("  serial replay of the chain matches the parallel executor byte-for-byte ✓");
 
+    // --- Slashing: equivocation is provable -------------------------------------
+    // Validator 2 has been Byzantine all along. Beyond voting for corrupt
+    // blocks, a validator can *equivocate* — sign two conflicting votes in one
+    // view. That is cryptographic self-incrimination: anyone, including a
+    // light client, can verify the evidence against the validator set.
+    println!("\n=== Slashing: catching an equivocator ===");
+    println!("  no equivocation during the honest run (evidence log empty: {})", engine.slashing_evidence.is_empty());
+    // Validator 2 already cast a vote in view 0 (round 1). It now gossips a
+    // second, conflicting vote for the same view — a phantom fork block.
+    let double_vote = engine.validators[2].sign_vote(Hash::of(b"phantom fork block"), 1, 0, true);
+    match engine.observe_external_vote(double_vote) {
+        Some(evidence) => {
+            assert!(evidence.verify(&engine.validator_keys()));
+            println!(
+                "  validator {} signed two different blocks in view {} → slashing evidence verifies ✓",
+                evidence.validator, evidence.view
+            );
+            println!("  (in production this burns the offender's staked figs; here it is logged)");
+        }
+        None => panic!("expected to catch validator 2's double-sign"),
+    }
+    assert_eq!(engine.slashing_evidence.len(), 1);
+
+    // --- Fee market: EIP-1559-style burn + native sponsorship -------------------
+    println!("\n=== Fee market: burned fees and native sponsorship ===");
+    {
+        let mut market = State::new();
+        market.set_base_fee(2); // every included transaction burns 2 figs
+
+        let spender_policy = AuthPolicy::SingleKey(alice_kp.public());
+        let sponsor_policy = AuthPolicy::SingleKey(bob_kp.public());
+        let spender = AccountId::from_auth(&spender_policy, 0);
+        let sponsor = AccountId::from_auth(&sponsor_policy, 0);
+        let merchant = AccountId::from_label("merchant");
+        market.genesis_account_with_auth(spender, 100, spender_policy);
+        market.genesis_account_with_auth(sponsor, 100, sponsor_policy);
+        let supply_before = market.total_supply();
+        println!("  base_fee = 2 figs/tx (burned); supply before = {supply_before} figs");
+
+        let batch = vec![
+            // The spender pays its own fee.
+            Transaction::transfer(spender, 0, merchant, 30)
+                .with_max_fee(2)
+                .signed(&alice_kp),
+            // The sponsor foots the fee so the spender can move its last figs.
+            Transaction::transfer(spender, 1, merchant, 68)
+                .with_max_fee(2)
+                .with_sponsor(sponsor)
+                .signed(&alice_kp),
+        ];
+        let out = phi_executor::execute(&mut market, &batch);
+        assert!(out.receipts.iter().all(|r| r.result.is_ok()));
+        println!("  tx1 spender self-pays the fee; tx2 a sponsor pays so the spender keeps the full amount");
+        println!(
+            "  fees burned: {} figs → supply {} = {} - {}",
+            out.fees_burned,
+            market.total_supply(),
+            supply_before,
+            out.fees_burned
+        );
+        println!(
+            "  balances: spender {}  sponsor {}  merchant {}",
+            market.balance(&spender),
+            market.balance(&sponsor),
+            market.balance(&merchant)
+        );
+        assert_eq!(out.fees_burned, 4);
+        assert_eq!(market.total_supply(), supply_before - 4);
+
+        // Defense in depth: the Cargo supply audit reconciles the burn
+        // (post == pre + minted - burned), so a block that *claimed* to burn
+        // fees while leaking figs elsewhere would be refused quorum.
+        FigGovernor::default()
+            .audit_block(supply_before, market.total_supply(), &batch, &out.receipts)
+            .expect("burned-fee supply must reconcile");
+        println!("  Cargo supply audit reconciles the burn (post = pre + minted - burned) ✓");
+    }
+
+    // --- Standard lane: fee-priority block building -----------------------------
+    println!("\n=== Standard lane: fee-priority mempool ===");
+    {
+        let mut lane_state = State::new();
+        for who in ["hodler", "trader", "whale"] {
+            lane_state.genesis_account(AccountId::from_label(who), 1_000);
+        }
+        let dex = AccountId::from_label("dex");
+        let bid = |who: &str, nonce: u64, tip: u64| {
+            Transaction::transfer(AccountId::from_label(who), nonce, dex, 1).with_max_fee(tip)
+        };
+        let mut lane = Mempool::new(16);
+        // Submitted in arrival order; the tips disagree with that order.
+        lane.submit(bid("hodler", 0, 1), &lane_state).unwrap();
+        lane.submit(bid("trader", 0, 5), &lane_state).unwrap();
+        lane.submit(bid("whale", 0, 50), &lane_state).unwrap();
+        lane.submit(bid("trader", 1, 5), &lane_state).unwrap();
+
+        let label_of = |id: &AccountId| -> &'static str {
+            ["hodler", "trader", "whale"]
+                .into_iter()
+                .find(|w| AccountId::from_label(w) == *id)
+                .unwrap_or("?")
+        };
+        println!("  highest tip is included first; each sender stays in nonce order:");
+        let priority = lane.take_priority_batch(4);
+        for tx in &priority {
+            println!("    {:<6} nonce {}  tip {}", label_of(&tx.sender), tx.nonce, tx.max_fee);
+        }
+        assert_eq!(priority[0].max_fee, 50); // whale jumps the queue
+        assert_eq!(priority.last().unwrap().max_fee, 1); // lowest tip last
+    }
+
     println!("\nSimulation complete.");
 }

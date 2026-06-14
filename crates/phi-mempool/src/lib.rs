@@ -189,6 +189,73 @@ impl Mempool {
         batch
     }
 
+    /// Select up to `max` transactions for the next block **fee-first**: at
+    /// each step the pending head of the highest-`max_fee` sender is taken,
+    /// so a richer tip jumps the line — yet each sender's transactions still
+    /// leave in strict nonce order (a sender's nonce *n+1* can never be
+    /// selected before its nonce *n*, which would produce an unincludable
+    /// gap). Ties break toward the earlier submission, so a uniform-fee
+    /// mempool drains in exactly the FIFO order of [`Mempool::take_batch`].
+    ///
+    /// This is the standard-lane counterpart to the free lane: it turns the
+    /// otherwise-dormant `max_fee` into inclusion priority under congestion.
+    pub fn take_priority_batch(&mut self, max: usize) -> Vec<Transaction> {
+        let n = max.min(self.queue.len());
+        if n == 0 {
+            return Vec::new();
+        }
+
+        // Snapshot positions, grouped per sender in nonce (submission) order.
+        let snapshot: Vec<Transaction> = self.queue.iter().cloned().collect();
+        let mut heads: HashMap<AccountId, VecDeque<usize>> = HashMap::new();
+        for (i, tx) in snapshot.iter().enumerate() {
+            heads.entry(tx.sender).or_default().push_back(i);
+        }
+
+        let mut selected = vec![false; snapshot.len()];
+        let mut chosen: Vec<usize> = Vec::with_capacity(n);
+        for _ in 0..n {
+            // Highest-fee pending head wins; index comparison makes the
+            // tie-break (and thus the whole selection) deterministic
+            // regardless of hash-map iteration order.
+            let mut best: Option<usize> = None;
+            for positions in heads.values() {
+                if let Some(&head) = positions.front() {
+                    let wins = match best {
+                        None => true,
+                        Some(b) => {
+                            let (head_fee, best_fee) = (snapshot[head].max_fee, snapshot[b].max_fee);
+                            head_fee > best_fee || (head_fee == best_fee && head < b)
+                        }
+                    };
+                    if wins {
+                        best = Some(head);
+                    }
+                }
+            }
+            let head = best.expect("n <= queue length guarantees a pending head");
+            heads
+                .get_mut(&snapshot[head].sender)
+                .expect("the chosen head's sender is grouped")
+                .pop_front();
+            selected[head] = true;
+            chosen.push(head);
+        }
+
+        let batch: Vec<Transaction> = chosen.iter().map(|&i| snapshot[i].clone()).collect();
+        // Keep the unselected transactions in their original relative order.
+        self.queue = snapshot
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| !selected[*i])
+            .map(|(_, tx)| tx)
+            .collect();
+        for tx in &batch {
+            self.untrack(tx);
+        }
+        batch
+    }
+
     /// Return a batch to the front of the queue in its original order —
     /// called when a consensus round fails to commit, so transactions are
     /// never silently dropped with the rejected proposal.
@@ -424,6 +491,93 @@ mod tests {
             Err(AdmissionError::Invalid(
                 phi_state::TxError::InsufficientBalance { have: 0, need: 1 }
             ))
+        );
+    }
+
+    #[test]
+    fn priority_batch_serves_higher_fees_first_preserving_nonce_order() {
+        let state = funded_state();
+        let mut pool = Mempool::new(16);
+        // Alice queues two low-fee transactions; Bob one high-fee transaction.
+        pool.submit(
+            Transaction::transfer(id("alice"), 0, id("carol"), 1).with_max_fee(1),
+            &state,
+        )
+        .unwrap();
+        pool.submit(
+            Transaction::transfer(id("alice"), 1, id("carol"), 1).with_max_fee(1),
+            &state,
+        )
+        .unwrap();
+        pool.submit(
+            Transaction::transfer(id("bob"), 0, id("carol"), 1).with_max_fee(9),
+            &state,
+        )
+        .unwrap();
+
+        let batch = pool.take_priority_batch(3);
+        // Bob's richer tip jumps ahead; Alice's two follow in nonce order.
+        assert_eq!(batch[0].sender, id("bob"));
+        assert_eq!((batch[1].sender, batch[1].nonce), (id("alice"), 0));
+        assert_eq!((batch[2].sender, batch[2].nonce), (id("alice"), 1));
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn priority_batch_with_uniform_fees_matches_fifo() {
+        let state = funded_state();
+        let mut pool = Mempool::new(16);
+        pool.submit(Transaction::transfer(id("alice"), 0, id("bob"), 1), &state)
+            .unwrap();
+        pool.submit(Transaction::transfer(id("carol"), 0, id("bob"), 1), &state)
+            .unwrap();
+        pool.submit(Transaction::transfer(id("alice"), 1, id("bob"), 1), &state)
+            .unwrap();
+
+        let order: Vec<(AccountId, u64)> = pool
+            .take_priority_batch(3)
+            .iter()
+            .map(|t| (t.sender, t.nonce))
+            .collect();
+        // No fee differences -> identical to FIFO submission order.
+        assert_eq!(
+            order,
+            vec![(id("alice"), 0), (id("carol"), 0), (id("alice"), 1)]
+        );
+    }
+
+    #[test]
+    fn priority_batch_leaves_lowest_fee_behind_and_stays_consistent() {
+        let state = funded_state();
+        let mut pool = Mempool::new(16);
+        pool.submit(
+            Transaction::transfer(id("alice"), 0, id("bob"), 1).with_max_fee(1),
+            &state,
+        )
+        .unwrap();
+        pool.submit(
+            Transaction::transfer(id("bob"), 0, id("carol"), 1).with_max_fee(5),
+            &state,
+        )
+        .unwrap();
+        pool.submit(
+            Transaction::transfer(id("carol"), 0, id("alice"), 1).with_max_fee(3),
+            &state,
+        )
+        .unwrap();
+
+        // Take the two richest; the low-fee tx stays queued.
+        let batch = pool.take_priority_batch(2);
+        assert_eq!(
+            batch.iter().map(|t| t.max_fee).collect::<Vec<_>>(),
+            vec![5, 3]
+        );
+        assert_eq!(pool.len(), 1);
+        // Tracking stayed consistent: the still-queued tx rejects its duplicate.
+        let duplicate = Transaction::transfer(id("alice"), 0, id("bob"), 1).with_max_fee(1);
+        assert_eq!(
+            pool.submit(duplicate, &state),
+            Err(AdmissionError::Duplicate)
         );
     }
 }
