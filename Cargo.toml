@@ -10,6 +10,7 @@ members = [
     "crates/phi-consensus",
     "crates/phi-interop",
     "crates/phi-vm",
+    "crates/phi-node",
     "crates/phi-sim",
 ]
 
@@ -30,6 +31,7 @@ phi-mempool = { path = "crates/phi-mempool" }
 phi-consensus = { path = "crates/phi-consensus" }
 phi-interop = { path = "crates/phi-interop" }
 phi-vm = { path = "crates/phi-vm" }
+phi-node = { path = "crates/phi-node" }
 
 # Crypto and hashing are hot paths even in debug test runs (the SMT hashes
 # O(accounts * 256) nodes per root); optimize dependencies only.

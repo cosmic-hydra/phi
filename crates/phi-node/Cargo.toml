@@ -1,0 +1,15 @@
+[package]
+name = "phi-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "phi-node: a persistent single-node Phi devnet with a CLI"
+
+[dependencies]
+phi-crypto = { workspace = true }
+phi-types = { workspace = true }
+phi-state = { workspace = true }
+
+[[bin]]
+name = "phi-node"
+path = "src/main.rs"

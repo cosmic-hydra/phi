@@ -37,8 +37,12 @@ are designed-for but **not implemented**, and must not be relied on:
   produced or punished).
 - **Pacemaker / liveness under asynchrony** beyond the simple view-change
   shown here.
-- **Key management** (HSM/keystore, rotation, forward security). Simulation
-  keys are label-derived and deterministic — never use them anywhere real.
+- **Key management** (HSM/keystore, rotation, forward security). Keys are
+  label-derived and deterministic (in the sim and the `phi-node` devnet) —
+  anyone can recompute them, so they are for local use only, never real value.
+- **Durable, replicated storage.** `phi-node` persists a single local snapshot
+  file (no crash-consistent WAL, no replication, no state sync between nodes);
+  it is a single-sequencer devnet, not a fault-tolerant store.
 - **Long-range / weak-subjectivity attacks**, checkpoint anchoring, and the
   ZK/privacy layers (Phase 3 in the spec).
 - **Interop hardening beyond light-client basics**: the `phi-interop` adapters

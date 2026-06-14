@@ -33,6 +33,7 @@ crates/
 │                   # verifiers (PoW + BFT adapters), no multisig bridges
 ├── phi-vm/         # PhiVM: deterministic, gas-metered bytecode VM for smart
 │                   # contracts (atomic revert-on-trap, bounded resources)
+├── phi-node/       # persistent single-node devnet + CLI (init/fund/transfer)
 └── phi-sim/        # local simulation binary demonstrating the full pipeline
 ```
 
@@ -53,6 +54,37 @@ cargo run -p phi-sim
 # Run the test suite
 cargo test --workspace
 ```
+
+### Run a local devnet you can actually use
+
+`phi-node` is a persistent single-node devnet — a real, runnable chain (not a
+test). State is written to `./phi-chain.snapshot` (override with `$PHI_CHAIN`)
+and survives between commands:
+
+```bash
+cargo run -p phi-node -- init --chain-id 1 --supply 1000000
+cargo run -p phi-node -- address alice
+cargo run -p phi-node -- fund alice 1000          # treasury -> alice
+cargo run -p phi-node -- transfer alice bob 400   # signed; first spend claims alice
+cargo run -p phi-node -- balance bob              # 400
+cargo run -p phi-node -- state                    # height, supply, state root
+```
+
+Every command signs with real Ed25519 keys, runs the same state machine the
+tests cover, produces a block with committed roots, and conserves supply.
+**This is a local devnet, not a deployable network** — see "Is it production
+ready?" below.
+
+## Is it production ready?
+
+**No.** Phi is a well-tested research implementation, not a deployable
+blockchain. It has no peer-to-peer networking (the devnet is a single
+sequencer), no multi-validator consensus liveness/pacemaker, no slashing, no
+persistence beyond the local snapshot, no audits, and the smart-contract VM is
+not yet wired into the ledger. It is genuinely *usable* locally — you can run
+it, move value, and inspect committed state — but it must not be used to hold
+real value. [SECURITY.md](SECURITY.md) is the authoritative threat model and
+gap list.
 
 The simulation demonstrates:
 

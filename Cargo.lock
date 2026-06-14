@@ -263,6 +263,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "phi-node"
+version = "0.1.0"
+dependencies = [
+ "phi-crypto",
+ "phi-state",
+ "phi-types",
+]
+
+[[package]]
 name = "phi-sim"
 version = "0.1.0"
 dependencies = [

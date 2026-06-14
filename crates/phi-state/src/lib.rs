@@ -151,6 +151,64 @@ fn account_value_hash(account: &Account) -> Hash {
     Hash::of_tagged(b"phi:account:state", &[&account.encode()])
 }
 
+const SNAPSHOT_MAGIC: &[u8; 4] = b"PHIS";
+const SNAPSHOT_VERSION: u8 = 1;
+
+/// Minimal bounds-checked byte reader for snapshot decoding.
+struct Reader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        if end > self.buf.len() {
+            return None;
+        }
+        let slice = &self.buf[self.pos..end];
+        self.pos = end;
+        Some(slice)
+    }
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn array32(&mut self) -> Option<[u8; 32]> {
+        self.take(32)?.try_into().ok()
+    }
+    fn is_empty(&self) -> bool {
+        self.pos == self.buf.len()
+    }
+}
+
+/// Decode an [`AuthPolicy`] written by [`AuthPolicy::encode`].
+fn decode_auth(r: &mut Reader) -> Option<AuthPolicy> {
+    match r.u8()? {
+        0 => Some(AuthPolicy::Open),
+        1 => Some(AuthPolicy::SingleKey(phi_crypto::PublicKey(r.array32()?))),
+        2 => {
+            let m = r.u8()?;
+            let n = r.u32()? as usize;
+            let mut keys = Vec::with_capacity(n);
+            for _ in 0..n {
+                keys.push(phi_crypto::PublicKey(r.array32()?));
+            }
+            Some(AuthPolicy::Threshold { m, keys })
+        }
+        3 => Some(AuthPolicy::Unclaimed),
+        _ => None,
+    }
+}
+
 impl State {
     pub fn new() -> Self {
         Self::default()
@@ -188,6 +246,84 @@ impl State {
     /// layer on top of this base-ledger rule.
     pub fn set_minter(&mut self, minter: Option<AccountId>) {
         self.minter = minter;
+    }
+
+    /// Iterate accounts in deterministic (id) order.
+    pub fn iter_accounts(&self) -> impl Iterator<Item = &Account> {
+        self.accounts.values()
+    }
+
+    /// Number of accounts in the ledger.
+    pub fn account_count(&self) -> usize {
+        self.accounts.len()
+    }
+
+    /// Serialize the full ledger to a portable byte snapshot, so a node can
+    /// persist state across restarts. Versioned and length-prefixed; the
+    /// format is for storage only and is independent of the SMT state root.
+    pub fn snapshot(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(SNAPSHOT_MAGIC);
+        out.push(SNAPSHOT_VERSION);
+        out.extend_from_slice(&self.chain_id.to_le_bytes());
+        match self.minter {
+            None => out.push(0),
+            Some(id) => {
+                out.push(1);
+                out.extend_from_slice(id.0.as_bytes());
+            }
+        }
+        out.extend_from_slice(&(self.accounts.len() as u32).to_le_bytes());
+        for account in self.accounts.values() {
+            out.extend_from_slice(account.id.0.as_bytes());
+            out.extend_from_slice(&account.balance.to_le_bytes());
+            out.extend_from_slice(&account.nonce.to_le_bytes());
+            out.extend_from_slice(&account.auth.encode());
+        }
+        out
+    }
+
+    /// Reconstruct a ledger from [`State::snapshot`] bytes. Returns `None` on
+    /// any malformed input (truncation, bad magic/version, bad tag).
+    pub fn from_snapshot(bytes: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(bytes);
+        if r.take(SNAPSHOT_MAGIC.len())? != SNAPSHOT_MAGIC.as_slice() {
+            return None;
+        }
+        if r.u8()? != SNAPSHOT_VERSION {
+            return None;
+        }
+        let chain_id = r.u64()?;
+        let minter = match r.u8()? {
+            0 => None,
+            1 => Some(AccountId(Hash(r.array32()?))),
+            _ => return None,
+        };
+        let count = r.u32()? as usize;
+        let mut state = State {
+            accounts: BTreeMap::new(),
+            chain_id,
+            minter,
+        };
+        for _ in 0..count {
+            let id = AccountId(Hash(r.array32()?));
+            let balance = r.u64()?;
+            let nonce = r.u64()?;
+            let auth = decode_auth(&mut r)?;
+            state.accounts.insert(
+                id,
+                Account {
+                    id,
+                    balance,
+                    nonce,
+                    auth,
+                },
+            );
+        }
+        if !r.is_empty() {
+            return None; // trailing garbage
+        }
+        Some(state)
     }
 
     /// Create an `Open`-auth account with an initial balance (genesis/test
@@ -841,6 +977,60 @@ mod tests {
 
     fn nex_signature_placeholder() -> phi_crypto::Signature {
         phi_crypto::Signature([0u8; phi_crypto::SIGNATURE_LEN])
+    }
+
+    #[test]
+    fn snapshot_round_trips_full_state() {
+        use phi_crypto::Keypair;
+        let mut state = State::new();
+        state.set_chain_id(42);
+        let treasury = id("treasury");
+        state.set_minter(Some(treasury));
+        state.genesis_account(treasury, 1_000); // Open auth
+        state.genesis_account_with_auth(
+            id("alice"),
+            500,
+            AuthPolicy::SingleKey(Keypair::from_label("alice").public()),
+        );
+        state.genesis_account_with_auth(
+            id("council"),
+            0,
+            AuthPolicy::Threshold {
+                m: 2,
+                keys: (0..3)
+                    .map(|i| Keypair::from_label(&format!("g{i}")).public())
+                    .collect(),
+            },
+        );
+        // Apply a tx so a nonce is non-zero.
+        state.apply_tx(&Transaction::transfer(treasury, 0, id("bob"), 10));
+
+        let bytes = state.snapshot();
+        let restored = State::from_snapshot(&bytes).expect("valid snapshot");
+        // Byte-identical re-serialization and identical state root.
+        assert_eq!(restored.snapshot(), bytes);
+        assert_eq!(restored.root(), state.root());
+        assert_eq!(restored.chain_id(), 42);
+        assert_eq!(restored.minter(), Some(treasury));
+        assert_eq!(restored.account_count(), state.account_count());
+        assert_eq!(restored.balance(&treasury), state.balance(&treasury));
+        assert_eq!(
+            restored.account(&id("alice")).unwrap().auth,
+            state.account(&id("alice")).unwrap().auth
+        );
+    }
+
+    #[test]
+    fn malformed_snapshots_are_rejected() {
+        assert!(State::from_snapshot(b"").is_none());
+        assert!(State::from_snapshot(b"NOPE........").is_none());
+        let mut good = State::new();
+        good.genesis_account(id("a"), 1);
+        let bytes = good.snapshot();
+        assert!(State::from_snapshot(&bytes[..bytes.len() - 1]).is_none()); // truncated
+        let mut trailing = bytes.clone();
+        trailing.push(0xff);
+        assert!(State::from_snapshot(&trailing).is_none()); // trailing garbage
     }
 
     #[test]

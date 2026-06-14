@@ -7,6 +7,4 @@ description = "Phi state machine: SMT-committed account store and deterministic 
 
 [dependencies]
 phi-types = { workspace = true }
-
-[dev-dependencies]
 phi-crypto = { workspace = true }
